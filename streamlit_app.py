@@ -219,13 +219,16 @@ def render_results(results, errors, workbook_binary: bytes):
     if note_rows:
         st.dataframe(pd.DataFrame(note_rows), width="stretch", hide_index=True)
 
-    st.download_button(
-        label="Download Excel workbook",
-        data=workbook_binary,
-        file_name="sec_financial_screening.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        width="stretch",
-    )
+    if workbook_binary is not None:
+        st.download_button(
+            label="Download Excel workbook",
+            data=workbook_binary,
+            file_name="sec_financial_screening.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="stretch",
+        )
+    else:
+        st.warning("Excel download is unavailable because `openpyxl` is not installed in the current environment.")
 
 
 def main():
@@ -298,8 +301,12 @@ def main():
                         flag_rows = [row for result in results for row in result_to_flag_rows(result)]
                         note_rows = [row for result in results for row in result_to_note_rows(result)]
                         error_rows = [error_to_row(error) for error in errors]
-                        binary = workbook_bytes(summary_rows, flag_rows, note_rows, error_rows)
-                        status.write("4. Excel workbook generated")
+                        binary = None
+                        try:
+                            binary = workbook_bytes(summary_rows, flag_rows, note_rows, error_rows)
+                            status.write("4. Excel workbook generated")
+                        except Exception as exc:
+                            status.write(f"4. Excel workbook skipped: {exc}")
                         status.update(label="Screening complete", state="complete")
                     st.session_state["results"] = results
                     st.session_state["errors"] = errors
@@ -310,12 +317,12 @@ def main():
     if st.session_state.get("error"):
         st.error(st.session_state["error"])
 
-    if st.session_state.get("results") is not None and st.session_state.get("workbook_binary") is not None:
+    if st.session_state.get("results") is not None:
         render_dashboard(st.session_state["results"])
         render_results(
             st.session_state["results"],
             st.session_state.get("errors") or [],
-            st.session_state["workbook_binary"],
+            st.session_state.get("workbook_binary"),
         )
 
     with st.expander("About this tool", expanded=False):
