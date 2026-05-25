@@ -4,7 +4,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from sec_edgar_client import CompanyMatch, get_user_agent, search_companies
+from sec_edgar_client import CompanyMatch, search_companies
 from sec_excel_export import workbook_bytes
 from sec_screening import error_to_row, result_to_flag_rows, result_to_note_rows, result_to_summary_row, screen_companies
 
@@ -21,46 +21,24 @@ def parse_input_queries(raw_text: str) -> list[str]:
     return queries
 
 
-def render_match_table(matches: list[CompanyMatch]):
-    st.dataframe(
-        [
-            {
-                "Company": match.company_name,
-                "Ticker": match.ticker,
-                "CIK": match.cik,
-                "SIC": match.sic or "-",
-                "Industry": match.sic_description or "-",
-            }
-            for match in matches
-        ],
-        width="stretch",
-        hide_index=True,
-    )
-
-
-def format_ratio(value):
-    if value is None:
-        return "-"
-    return f"{value * 100:.1f}%"
-
-
-def format_multiple(value):
-    if value is None:
-        return "-"
-    return f"{value:.2f}x"
-
-
 def percent_or_none(value):
     if value is None:
         return None
     return value * 100
 
 
+def candidate_option_label(match: CompanyMatch) -> str:
+    industry = match.sic_description or "-"
+    return f"{match.company_name} | {match.ticker} | CIK {match.cik} | {industry}"
+
+
 def render_candidate_preview(query_matches: list[tuple[str, list[CompanyMatch]]]):
-    preview_rows = []
     selected_matches = []
-    for query, matches in query_matches:
+    preview_rows = []
+    for index, (query, matches) in enumerate(query_matches, start=1):
+        st.markdown(f"**{index}. Input:** `{query}`")
         if not matches:
+            st.warning("No SEC match found for this input.")
             preview_rows.append(
                 {
                     "Input": query,
@@ -72,26 +50,52 @@ def render_candidate_preview(query_matches: list[tuple[str, list[CompanyMatch]]]
                 }
             )
             continue
-        best = matches[0]
+
+        options = [candidate_option_label(match) for match in matches]
+        selected_label = st.selectbox(
+            f"Choose the company for {query}",
+            options=options,
+            index=0,
+            key=f"company_match_{index}_{query}",
+            label_visibility="collapsed",
+        )
+        selected_match = matches[options.index(selected_label)]
+        selected_matches.append(selected_match)
         preview_rows.append(
             {
                 "Input": query,
-                "Selected Company": best.company_name,
-                "Ticker": best.ticker,
-                "CIK": best.cik,
-                "Industry": best.sic_description or "-",
-                "Note": "Top SEC match auto-selected",
+                "Selected Company": selected_match.company_name,
+                "Ticker": selected_match.ticker,
+                "CIK": selected_match.cik,
+                "Industry": selected_match.sic_description or "-",
+                "Note": "User-selected SEC match",
             }
         )
-        selected_matches.append(best)
-    st.dataframe(preview_rows, width="stretch", hide_index=True)
+        with st.expander(f"Show candidate details for {query}", expanded=False):
+            st.dataframe(
+                [
+                    {
+                        "Company": match.company_name,
+                        "Ticker": match.ticker,
+                        "CIK": match.cik,
+                        "SIC": match.sic or "-",
+                        "Industry": match.sic_description or "-",
+                    }
+                    for match in matches
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+    if preview_rows:
+        st.subheader("Selection summary")
+        st.dataframe(preview_rows, width="stretch", hide_index=True)
     return selected_matches
 
 
 def build_dashboard_frames(results) -> tuple[pd.DataFrame, pd.DataFrame]:
     metric_rows = []
     flag_rows = []
-    for result in sorted(results, key=lambda item: item.company_name):
+    for result in sorted(results, key=lambda item: (item.company_name, item.fiscal_year)):
         severe_count = sum(
             1
             for flag in (result.red_flags or [])
@@ -101,7 +105,7 @@ def build_dashboard_frames(results) -> tuple[pd.DataFrame, pd.DataFrame]:
             {
                 "Company": result.company_name,
                 "Ticker": result.ticker,
-                "Latest FY": result.fiscal_year,
+                "Fiscal Year": result.fiscal_year,
                 "Revenue ($m)": (result.metrics.get("revenue") or 0) / 1_000_000 if result.metrics.get("revenue") is not None else None,
                 "Operating Margin (%)": percent_or_none(result.metrics.get("operating_margin")),
                 "Debt Ratio (%)": percent_or_none(result.metrics.get("debt_ratio")),
@@ -115,12 +119,26 @@ def build_dashboard_frames(results) -> tuple[pd.DataFrame, pd.DataFrame]:
             {
                 "Company": result.company_name,
                 "Ticker": result.ticker,
-                "Latest FY": result.fiscal_year,
+                "Fiscal Year": result.fiscal_year,
                 "Red Flag Count": len(result.red_flags or []),
                 "Severe Red Flag Count": severe_count,
             }
         )
     return pd.DataFrame(metric_rows), pd.DataFrame(flag_rows)
+
+
+def line_chart(metric_df: pd.DataFrame, column: str, title: str, y_title: str, color: str):
+    chart_df = metric_df.dropna(subset=[column])
+    if chart_df.empty:
+        st.info(f"No data available for {title.lower()}.")
+        return
+    chart = alt.Chart(chart_df).mark_line(point=True).encode(
+        x=alt.X("Fiscal Year:O", title="Fiscal Year"),
+        y=alt.Y(f"{column}:Q", title=y_title),
+        color=alt.Color("Company:N", title="Company"),
+        tooltip=["Company", "Ticker", "Fiscal Year", column],
+    ).properties(height=320, title=title)
+    st.altair_chart(chart, use_container_width=True)
 
 
 def render_dashboard(results):
@@ -130,58 +148,47 @@ def render_dashboard(results):
         return
 
     st.subheader("Dashboard")
-    tab1, tab2, tab3 = st.tabs(["Metric charts", "Red flag charts", "Raw tables"])
+    tab1, tab2, tab3 = st.tabs(["Trend charts", "Red flag trends", "Raw tables"])
 
     with tab1:
         c1, c2 = st.columns(2)
-        revenue_chart = alt.Chart(metric_df.dropna(subset=["Revenue ($m)"])).mark_bar().encode(
-            x=alt.X("Company:N", title="Company", sort="-y"),
-            y=alt.Y("Revenue ($m):Q", title="Revenue ($m)"),
-            tooltip=["Company", "Ticker", "Latest FY", "Revenue ($m)"],
-            color=alt.value("#1f77b4"),
-        ).properties(height=320, title="Latest annual revenue")
-        c1.altair_chart(revenue_chart, use_container_width=True)
-
-        debt_chart = alt.Chart(metric_df.dropna(subset=["Debt Ratio (%)"])).mark_bar().encode(
-            x=alt.X("Company:N", title="Company", sort="-y"),
-            y=alt.Y("Debt Ratio (%):Q", title="Debt Ratio (%)"),
-            tooltip=["Company", "Ticker", "Latest FY", "Debt Ratio (%)"],
-            color=alt.value("#d35400"),
-        ).properties(height=320, title="Debt ratio snapshot")
-        c2.altair_chart(debt_chart, use_container_width=True)
+        with c1:
+            line_chart(metric_df, "Revenue ($m)", "Revenue trend", "Revenue ($m)", "#1f77b4")
+        with c2:
+            line_chart(metric_df, "Operating Margin (%)", "Operating margin trend", "Operating Margin (%)", "#2e8b57")
 
         c3, c4 = st.columns(2)
-        margin_chart = alt.Chart(metric_df.dropna(subset=["Operating Margin (%)"])).mark_bar().encode(
-            x=alt.X("Company:N", title="Company", sort="-y"),
-            y=alt.Y("Operating Margin (%):Q", title="Operating Margin (%)"),
-            tooltip=["Company", "Ticker", "Latest FY", "Operating Margin (%)"],
-            color=alt.value("#2e8b57"),
-        ).properties(height=320, title="Operating margin snapshot")
-        c3.altair_chart(margin_chart, use_container_width=True)
-
-        cfo_chart = alt.Chart(metric_df.dropna(subset=["Operating Cash Flow ($m)"])).mark_bar().encode(
-            x=alt.X("Company:N", title="Company", sort="-y"),
-            y=alt.Y("Operating Cash Flow ($m):Q", title="Operating Cash Flow ($m)"),
-            tooltip=["Company", "Ticker", "Latest FY", "Operating Cash Flow ($m)"],
-            color=alt.value("#6c5ce7"),
-        ).properties(height=320, title="Operating cash flow snapshot")
-        c4.altair_chart(cfo_chart, use_container_width=True)
+        with c3:
+            line_chart(metric_df, "Debt Ratio (%)", "Debt ratio trend", "Debt Ratio (%)", "#d35400")
+        with c4:
+            line_chart(metric_df, "Operating Cash Flow ($m)", "Operating cash flow trend", "Operating Cash Flow ($m)", "#6c5ce7")
 
     with tab2:
-        red_bar = alt.Chart(flag_df).mark_bar().encode(
-            x=alt.X("Company:N", title="Company", sort="-y"),
-            y=alt.Y("Red Flag Count:Q", title="Red flag count"),
-            tooltip=["Company", "Ticker", "Latest FY", "Red Flag Count", "Severe Red Flag Count"],
-            color=alt.value("#c0392b"),
-        ).properties(height=320, title="Red flag count by company")
-        st.altair_chart(red_bar, use_container_width=True)
+        if flag_df.empty:
+            st.info("No red flag chart data is available.")
+        else:
+            red_chart = alt.Chart(flag_df).mark_line(point=True).encode(
+                x=alt.X("Fiscal Year:O", title="Fiscal Year"),
+                y=alt.Y("Red Flag Count:Q", title="Red Flag Count"),
+                color=alt.Color("Company:N", title="Company"),
+                tooltip=["Company", "Ticker", "Fiscal Year", "Red Flag Count", "Severe Red Flag Count"],
+            ).properties(height=320, title="Red flag count trend")
+            st.altair_chart(red_chart, use_container_width=True)
+
+            severe_chart = alt.Chart(flag_df).mark_line(point=True, strokeDash=[4, 2]).encode(
+                x=alt.X("Fiscal Year:O", title="Fiscal Year"),
+                y=alt.Y("Severe Red Flag Count:Q", title="Severe Red Flag Count"),
+                color=alt.Color("Company:N", title="Company"),
+                tooltip=["Company", "Ticker", "Fiscal Year", "Severe Red Flag Count"],
+            ).properties(height=320, title="Severe red flag trend")
+            st.altair_chart(severe_chart, use_container_width=True)
 
     with tab3:
         st.dataframe(metric_df, width="stretch", hide_index=True)
         st.dataframe(flag_df, width="stretch", hide_index=True)
 
 
-def render_results(results, errors, workbook_binary: bytes):
+def render_results(results, errors, workbook_binary: bytes | None):
     summary_rows = [result_to_summary_row(result) for result in results]
     flag_rows = [row for result in results for row in result_to_flag_rows(result)]
     note_rows = [row for result in results for row in result_to_note_rows(result)]
@@ -197,9 +204,9 @@ def render_results(results, errors, workbook_binary: bytes):
     col2.metric("Error count", len(errors))
     col3.metric("Company count", len({result.company_name for result in results}))
 
-    st.subheader("Latest annual summary")
+    st.subheader("Company-year summary")
     if summary_df.empty:
-        st.info("No successful company result is available.")
+        st.info("No successful company-year result is available.")
     else:
         st.dataframe(summary_df, width="stretch", hide_index=True)
 
@@ -236,17 +243,15 @@ def main():
     st.title(APP_TITLE)
     st.caption("U.S. public company preliminary financial screening tool based on SEC annual filing facts. Not a rating opinion. Human review required.")
 
+    current_year = 2026
     with st.sidebar:
         st.header("Input")
         default_queries = "MSFT\nAAPL\nNVDA\nCAT"
         query_text = st.text_area("Tickers or company names", value=default_queries, height=180, help="Enter multiple tickers or company names separated by commas or line breaks.")
+        start_year = st.number_input("Start year", min_value=2000, max_value=current_year, value=current_year - 2, step=1)
+        end_year = st.number_input("End year", min_value=2000, max_value=current_year, value=current_year, step=1)
         preview_button = st.button("Preview SEC matches", width="stretch")
         run_button = st.button("Run screening", type="primary", width="stretch")
-
-    st.info(
-        f"SEC API key is not required. Current request identity: `{get_user_agent()}`. "
-        "For production, set `SEC_USER_AGENT` to your company name and contact email."
-    )
 
     st.session_state.setdefault("query_matches", None)
     st.session_state.setdefault("selected_matches", None)
@@ -286,6 +291,8 @@ def main():
         st.session_state["workbook_binary"] = None
         if not queries:
             st.session_state["error"] = "Enter at least one ticker or company name."
+        elif int(start_year) > int(end_year):
+            st.session_state["error"] = "Start year cannot be later than end year."
         else:
             selected_matches = st.session_state.get("selected_matches") or []
             if not selected_matches:
@@ -295,8 +302,8 @@ def main():
                     with st.status("Running SEC screening...", expanded=True) as status:
                         status.write("1. SEC company matches resolved")
                         status.write("2. Downloading SEC company facts")
-                        results, errors = screen_companies(selected_matches)
-                        status.write("3. Calculating preliminary metrics and red flags")
+                        results, errors = screen_companies(selected_matches, int(start_year), int(end_year))
+                        status.write("3. Building multi-year metrics and red flags")
                         summary_rows = [result_to_summary_row(result) for result in results]
                         flag_rows = [row for result in results for row in result_to_flag_rows(result)]
                         note_rows = [row for result in results for row in result_to_note_rows(result)]
@@ -329,10 +336,10 @@ def main():
         st.markdown(
             """
             - This tool uses public SEC `companyfacts` data only.
-            - It currently focuses on annual facts from `10-K`, `20-F`, and `40-F`.
-            - Companies do not always report every concept in a perfectly comparable way.
+            - It focuses on annual facts from `10-K`, `20-F`, and `40-F`.
+            - You can choose the fiscal-year range to screen.
+            - Multiple companies are shown as time-series so you can compare their trends.
             - This is a preliminary financial screening workflow, not a formal credit opinion.
-            - Review the summary, red flags, and metric matching notes together before using the output.
             """
         )
 

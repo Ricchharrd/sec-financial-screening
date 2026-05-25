@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from sec_edgar_client import CompanyMatch, fetch_company_facts
 
 
+ANNUAL_FORMS = {"10-K", "20-F", "40-F"}
+
 CONCEPTS = {
     "revenue": [
         ("us-gaap", "Revenues"),
@@ -64,6 +66,7 @@ class ScreeningError:
     company_name: str
     ticker: str
     cik: str
+    fiscal_year: int | None
     error_message: str
 
 
@@ -81,7 +84,21 @@ def _unit_priority(unit_name: str) -> int:
     return 9
 
 
-def pick_latest_annual_fact(company_facts: dict, taxonomy: str, concept: str) -> dict | None:
+def annual_years_available(company_facts: dict) -> list[int]:
+    years = set()
+    for taxonomy_map in (company_facts.get("facts") or {}).values():
+        for concept_map in taxonomy_map.values():
+            for unit_rows in (concept_map.get("units") or {}).values():
+                for row in unit_rows:
+                    form = str(row.get("form") or "")
+                    fy = row.get("fy")
+                    fp = str(row.get("fp") or "")
+                    if form in ANNUAL_FORMS and fy and (not fp or fp == "FY"):
+                        years.add(int(fy))
+    return sorted(years)
+
+
+def pick_annual_fact(company_facts: dict, taxonomy: str, concept: str, fiscal_year: int) -> dict | None:
     facts = ((company_facts.get("facts") or {}).get(taxonomy) or {}).get(concept) or {}
     units = facts.get("units") or {}
     candidates: list[tuple[tuple, dict]] = []
@@ -92,15 +109,15 @@ def pick_latest_annual_fact(company_facts: dict, taxonomy: str, concept: str) ->
             fy = row.get("fy")
             fp = str(row.get("fp") or "")
             frame = str(row.get("frame") or "")
-            if form not in {"10-K", "20-F", "40-F"}:
+            if form not in ANNUAL_FORMS:
+                continue
+            if not fy or int(fy) != int(fiscal_year):
                 continue
             if fp and fp != "FY":
                 continue
-            if not fy:
-                continue
             end = str(row.get("end") or "")
             filed = str(row.get("filed") or "")
-            score = (int(fy), end, filed, -_unit_priority(unit_name), frame)
+            score = (end, filed, -_unit_priority(unit_name), frame)
             enriched = dict(row)
             enriched["unit"] = unit_name
             candidates.append((score, enriched))
@@ -111,20 +128,20 @@ def pick_latest_annual_fact(company_facts: dict, taxonomy: str, concept: str) ->
     return candidates[0][1]
 
 
-def extract_latest_metrics(company_facts: dict) -> tuple[dict, dict]:
+def extract_metrics_for_year(company_facts: dict, fiscal_year: int) -> tuple[dict, dict]:
     metrics = {}
     notes = {}
     for metric_key, concept_options in CONCEPTS.items():
         matched_fact = None
         matched_concept = None
         for taxonomy, concept in concept_options:
-            matched_fact = pick_latest_annual_fact(company_facts, taxonomy, concept)
+            matched_fact = pick_annual_fact(company_facts, taxonomy, concept, fiscal_year)
             if matched_fact:
                 matched_concept = f"{taxonomy}:{concept}"
                 break
         if matched_fact is None:
             metrics[metric_key] = None
-            notes[metric_key] = "No standard annual SEC fact matched."
+            notes[metric_key] = f"No standard annual SEC fact matched for FY{fiscal_year}."
         else:
             metrics[metric_key] = matched_fact.get("val")
             notes[metric_key] = f"Matched {matched_concept} ({matched_fact.get('form')}, FY{matched_fact.get('fy')})."
@@ -139,11 +156,10 @@ def extract_latest_metrics(company_facts: dict) -> tuple[dict, dict]:
         if metrics.get("current_assets") is None or metrics.get("current_liabilities") is None
         else metrics["current_assets"] - metrics["current_liabilities"]
     )
-
     return metrics, notes
 
 
-def infer_latest_filing_meta(company_facts: dict) -> dict:
+def infer_filing_meta_for_year(company_facts: dict, fiscal_year: int) -> dict:
     latest = None
     for taxonomy_map in (company_facts.get("facts") or {}).values():
         for concept_map in taxonomy_map.values():
@@ -152,7 +168,9 @@ def infer_latest_filing_meta(company_facts: dict) -> dict:
                     form = str(row.get("form") or "")
                     fy = row.get("fy")
                     fp = str(row.get("fp") or "")
-                    if form not in {"10-K", "20-F", "40-F"} or not fy:
+                    if form not in ANNUAL_FORMS or not fy or int(fy) != int(fiscal_year):
+                        continue
+                    if fp and fp != "FY":
                         continue
                     candidate = {
                         "fiscal_year": int(fy),
@@ -160,15 +178,9 @@ def infer_latest_filing_meta(company_facts: dict) -> dict:
                         "form": form,
                         "filed": str(row.get("filed") or ""),
                     }
-                    if latest is None or (
-                        candidate["fiscal_year"],
-                        candidate["filed"],
-                    ) > (
-                        latest["fiscal_year"],
-                        latest["filed"],
-                    ):
+                    if latest is None or candidate["filed"] > latest["filed"]:
                         latest = candidate
-    return latest or {"fiscal_year": 0, "fiscal_period": "FY", "form": "-", "filed": "-"}
+    return latest or {"fiscal_year": fiscal_year, "fiscal_period": "FY", "form": "-", "filed": "-"}
 
 
 def build_red_flags(metrics: dict) -> list[str]:
@@ -188,15 +200,14 @@ def build_red_flags(metrics: dict) -> list[str]:
     return flags
 
 
-def screen_company(match: CompanyMatch) -> ScreeningResult:
-    company_facts = fetch_company_facts(match.cik)
-    metrics, notes = extract_latest_metrics(company_facts)
-    filing_meta = infer_latest_filing_meta(company_facts)
+def screen_company_year(match: CompanyMatch, company_facts: dict, fiscal_year: int) -> ScreeningResult:
+    metrics, notes = extract_metrics_for_year(company_facts, fiscal_year)
+    filing_meta = infer_filing_meta_for_year(company_facts, fiscal_year)
     return ScreeningResult(
         company_name=match.company_name,
         ticker=match.ticker,
         cik=match.cik,
-        fiscal_year=filing_meta["fiscal_year"],
+        fiscal_year=fiscal_year,
         fiscal_period=filing_meta["fiscal_period"],
         form=filing_meta["form"],
         filed=filing_meta["filed"],
@@ -206,12 +217,46 @@ def screen_company(match: CompanyMatch) -> ScreeningResult:
     )
 
 
-def screen_companies(matches: list[CompanyMatch]) -> tuple[list[ScreeningResult], list[ScreeningError]]:
+def select_target_years(company_facts: dict, start_year: int, end_year: int) -> list[int]:
+    if start_year > end_year:
+        raise ValueError("Start year cannot be later than end year.")
+    available = annual_years_available(company_facts)
+    return [year for year in available if start_year <= year <= end_year]
+
+
+def screen_companies(matches: list[CompanyMatch], start_year: int, end_year: int) -> tuple[list[ScreeningResult], list[ScreeningError]]:
     results: list[ScreeningResult] = []
     errors: list[ScreeningError] = []
     for match in matches:
         try:
-            results.append(screen_company(match))
+            company_facts = fetch_company_facts(match.cik)
+            target_years = select_target_years(company_facts, start_year, end_year)
+            if not target_years:
+                errors.append(
+                    ScreeningError(
+                        input_query=match.ticker or match.company_name,
+                        company_name=match.company_name,
+                        ticker=match.ticker,
+                        cik=match.cik,
+                        fiscal_year=None,
+                        error_message=f"No annual SEC facts found between {start_year} and {end_year}.",
+                    )
+                )
+                continue
+            for fiscal_year in target_years:
+                try:
+                    results.append(screen_company_year(match, company_facts, fiscal_year))
+                except Exception as exc:
+                    errors.append(
+                        ScreeningError(
+                            input_query=match.ticker or match.company_name,
+                            company_name=match.company_name,
+                            ticker=match.ticker,
+                            cik=match.cik,
+                            fiscal_year=fiscal_year,
+                            error_message=str(exc),
+                        )
+                    )
         except Exception as exc:
             errors.append(
                 ScreeningError(
@@ -219,9 +264,11 @@ def screen_companies(matches: list[CompanyMatch]) -> tuple[list[ScreeningResult]
                     company_name=match.company_name,
                     ticker=match.ticker,
                     cik=match.cik,
+                    fiscal_year=None,
                     error_message=str(exc),
                 )
             )
+    results.sort(key=lambda item: (item.company_name, item.fiscal_year))
     return results, errors
 
 
@@ -230,7 +277,7 @@ def result_to_summary_row(result: ScreeningResult) -> dict:
         "Company": result.company_name,
         "Ticker": result.ticker,
         "CIK": result.cik,
-        "Latest FY": result.fiscal_year,
+        "Fiscal Year": result.fiscal_year,
         "Form": result.form,
         "Filed": result.filed,
         "Revenue": result.metrics.get("revenue"),
@@ -251,31 +298,29 @@ def result_to_summary_row(result: ScreeningResult) -> dict:
 
 
 def result_to_note_rows(result: ScreeningResult) -> list[dict]:
-    rows = []
-    for key, note in result.notes.items():
-        rows.append(
-            {
-                "Company": result.company_name,
-                "Ticker": result.ticker,
-                "Metric": key,
-                "Note": note,
-            }
-        )
-    return rows
+    return [
+        {
+            "Company": result.company_name,
+            "Ticker": result.ticker,
+            "Fiscal Year": result.fiscal_year,
+            "Metric": key,
+            "Note": note,
+        }
+        for key, note in result.notes.items()
+    ]
 
 
 def result_to_flag_rows(result: ScreeningResult) -> list[dict]:
-    rows = []
-    for index, flag in enumerate(result.red_flags, start=1):
-        rows.append(
-            {
-                "Company": result.company_name,
-                "Ticker": result.ticker,
-                "Seq": index,
-                "Flag": flag,
-            }
-        )
-    return rows
+    return [
+        {
+            "Company": result.company_name,
+            "Ticker": result.ticker,
+            "Fiscal Year": result.fiscal_year,
+            "Seq": index,
+            "Flag": flag,
+        }
+        for index, flag in enumerate(result.red_flags, start=1)
+    ]
 
 
 def error_to_row(error: ScreeningError) -> dict:
@@ -284,5 +329,6 @@ def error_to_row(error: ScreeningError) -> dict:
         "Company": error.company_name,
         "Ticker": error.ticker,
         "CIK": error.cik,
+        "Fiscal Year": error.fiscal_year if error.fiscal_year is not None else "-",
         "Error": error.error_message,
     }
