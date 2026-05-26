@@ -6,7 +6,14 @@ import streamlit as st
 
 from sec_edgar_client import CompanyMatch, search_companies
 from sec_excel_export import workbook_bytes
-from sec_screening import error_to_row, result_to_flag_rows, result_to_note_rows, result_to_summary_row, screen_companies
+from sec_screening import (
+    error_to_row,
+    result_to_flag_rows,
+    result_to_note_rows,
+    result_to_rating_rows,
+    result_to_summary_row,
+    screen_companies,
+)
 
 
 APP_TITLE = "SEC Preliminary Financial Screening"
@@ -19,6 +26,35 @@ def parse_input_queries(raw_text: str) -> list[str]:
         if cleaned:
             queries.append(cleaned)
     return queries
+
+
+def build_exchange_rate_inputs(start_year: int, end_year: int) -> dict[int, dict[str, float]]:
+    st.sidebar.subheader("FX rates")
+    years = list(range(int(start_year), int(end_year) + 1))
+    default_rows = [
+        {
+            "Fiscal Year": year,
+            "Closing USD/KRW": 1300.0,
+            "Average USD/KRW": 1300.0,
+        }
+        for year in years
+    ]
+    fx_df = st.sidebar.data_editor(
+        pd.DataFrame(default_rows),
+        hide_index=True,
+        width="stretch",
+        disabled=["Fiscal Year"],
+        key=f"fx_rates_{start_year}_{end_year}",
+    )
+    exchange_rates = {}
+    for row in fx_df.to_dict("records"):
+        year = int(row["Fiscal Year"])
+        closing = float(row["Closing USD/KRW"])
+        average = float(row["Average USD/KRW"])
+        if closing <= 0 or average <= 0:
+            raise ValueError("FX rates must be greater than zero.")
+        exchange_rates[year] = {"closing": closing, "average": average}
+    return exchange_rates
 
 
 def percent_or_none(value):
@@ -108,11 +144,13 @@ def build_dashboard_frames(results) -> tuple[pd.DataFrame, pd.DataFrame]:
                 "Fiscal Year": result.fiscal_year,
                 "Revenue ($m)": (result.metrics.get("revenue") or 0) / 1_000_000 if result.metrics.get("revenue") is not None else None,
                 "Operating Margin (%)": percent_or_none(result.metrics.get("operating_margin")),
-                "Debt Ratio (%)": percent_or_none(result.metrics.get("debt_ratio")),
+                "Liabilities / Equity (%)": percent_or_none(result.metrics.get("debt_ratio")),
                 "Current Ratio (x)": result.metrics.get("current_ratio"),
                 "Net Margin (%)": percent_or_none(result.metrics.get("net_margin")),
                 "ROA (%)": percent_or_none(result.metrics.get("roa")),
                 "Operating Cash Flow ($m)": (result.metrics.get("operating_cash_flow") or 0) / 1_000_000 if result.metrics.get("operating_cash_flow") is not None else None,
+                "Internal Score": result.rating.get("weighted_score") if result.rating else None,
+                "Internal Grade": result.rating.get("final_grade") if result.rating else None,
             }
         )
         flag_rows.append(
@@ -151,6 +189,16 @@ def render_dashboard(results):
     tab1, tab2, tab3 = st.tabs(["Trend charts", "Red flag trends", "Raw tables"])
 
     with tab1:
+        score_df = metric_df.dropna(subset=["Internal Score"])
+        if not score_df.empty:
+            score_chart = alt.Chart(score_df).mark_line(point=True, strokeWidth=3).encode(
+                x=alt.X("Fiscal Year:O", title="Fiscal Year"),
+                y=alt.Y("Internal Score:Q", title="Internal Score", scale=alt.Scale(domain=[0, 100])),
+                color=alt.Color("Company:N", title="Company"),
+                tooltip=["Company", "Ticker", "Fiscal Year", "Internal Score", "Internal Grade"],
+            ).properties(height=340, title="Internal rating score trend")
+            st.altair_chart(score_chart, use_container_width=True)
+
         c1, c2 = st.columns(2)
         with c1:
             line_chart(metric_df, "Revenue ($m)", "Revenue trend", "Revenue ($m)", "#1f77b4")
@@ -159,7 +207,7 @@ def render_dashboard(results):
 
         c3, c4 = st.columns(2)
         with c3:
-            line_chart(metric_df, "Debt Ratio (%)", "Debt ratio trend", "Debt Ratio (%)", "#d35400")
+            line_chart(metric_df, "Liabilities / Equity (%)", "Liabilities / equity trend", "Liabilities / Equity (%)", "#d35400")
         with c4:
             line_chart(metric_df, "Operating Cash Flow ($m)", "Operating cash flow trend", "Operating Cash Flow ($m)", "#6c5ce7")
 
@@ -192,9 +240,11 @@ def render_results(results, errors, workbook_binary: bytes | None):
     summary_rows = [result_to_summary_row(result) for result in results]
     flag_rows = [row for result in results for row in result_to_flag_rows(result)]
     note_rows = [row for result in results for row in result_to_note_rows(result)]
+    rating_rows = [row for result in results for row in result_to_rating_rows(result)]
     error_rows = [error_to_row(error) for error in errors]
     summary_df = pd.DataFrame(summary_rows)
     flag_df = pd.DataFrame(flag_rows)
+    rating_df = pd.DataFrame(rating_rows)
     error_df = pd.DataFrame(error_rows)
 
     st.success("SEC preliminary financial screening is complete. This is not a rating opinion and still requires human review.")
@@ -215,6 +265,12 @@ def render_results(results, errors, workbook_binary: bytes | None):
         st.info("No red flag detail is available.")
     else:
         st.dataframe(flag_df, width="stretch", hide_index=True)
+
+    st.subheader("Internal rating details")
+    if rating_df.empty:
+        st.info("No internal rating detail is available.")
+    else:
+        st.dataframe(rating_df, width="stretch", hide_index=True)
 
     st.subheader("Errors / missing cases")
     if error_df.empty:
@@ -250,6 +306,11 @@ def main():
         query_text = st.text_area("Tickers or company names", value=default_queries, height=180, help="Enter multiple tickers or company names separated by commas or line breaks.")
         start_year = st.number_input("Start year", min_value=2000, max_value=current_year, value=current_year - 2, step=1)
         end_year = st.number_input("End year", min_value=2000, max_value=current_year, value=current_year, step=1)
+        try:
+            exchange_rates = build_exchange_rate_inputs(int(start_year), int(end_year))
+        except Exception as exc:
+            exchange_rates = {}
+            st.error(str(exc))
         preview_button = st.button("Preview SEC matches", width="stretch")
         run_button = st.button("Run screening", type="primary", width="stretch")
 
@@ -293,6 +354,8 @@ def main():
             st.session_state["error"] = "Enter at least one ticker or company name."
         elif int(start_year) > int(end_year):
             st.session_state["error"] = "Start year cannot be later than end year."
+        elif not exchange_rates:
+            st.session_state["error"] = "Enter valid FX rates before running screening."
         else:
             selected_matches = st.session_state.get("selected_matches") or []
             if not selected_matches:
@@ -302,15 +365,16 @@ def main():
                     with st.status("Running SEC screening...", expanded=True) as status:
                         status.write("1. SEC company matches resolved")
                         status.write("2. Downloading SEC company facts")
-                        results, errors = screen_companies(selected_matches, int(start_year), int(end_year))
-                        status.write("3. Building multi-year metrics and red flags")
+                        results, errors = screen_companies(selected_matches, int(start_year), int(end_year), exchange_rates)
+                        status.write("3. Building multi-year metrics, FX translation, and internal ratings")
                         summary_rows = [result_to_summary_row(result) for result in results]
                         flag_rows = [row for result in results for row in result_to_flag_rows(result)]
                         note_rows = [row for result in results for row in result_to_note_rows(result)]
+                        rating_rows = [row for result in results for row in result_to_rating_rows(result)]
                         error_rows = [error_to_row(error) for error in errors]
                         binary = None
                         try:
-                            binary = workbook_bytes(summary_rows, flag_rows, note_rows, error_rows)
+                            binary = workbook_bytes(summary_rows, flag_rows, note_rows, error_rows, rating_rows=rating_rows)
                             status.write("4. Excel workbook generated")
                         except Exception as exc:
                             status.write(f"4. Excel workbook skipped: {exc}")
@@ -339,6 +403,9 @@ def main():
             - It focuses on annual facts from `10-K`, `20-F`, and `40-F`.
             - You can choose the fiscal-year range to screen.
             - Multiple companies are shown as time-series so you can compare their trends.
+            - Internal rating amounts are translated to KRW using closing rates for balance sheet items and average rates for income statement / cash flow items.
+            - Component grade points currently use AAA=100, AA=95, A=90, BB=80, B=70, CC=60, C=50, D=40.
+            - Duplicate threshold bands use the lower grade based on the current working rule.
             - This is a preliminary financial screening workflow, not a formal credit opinion.
             """
         )

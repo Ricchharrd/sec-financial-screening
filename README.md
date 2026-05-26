@@ -9,6 +9,7 @@ This folder contains a separate U.S. SEC / EDGAR-based screening tool.
 - Lets the user choose the matched company when there are multiple candidates
 - Pulls public company facts from SEC EDGAR `submissions` and `companyfacts`
 - Calculates a small set of preliminary screening metrics across a selected year range
+- Applies the internal financial capability rating grid using user-entered USD/KRW rates
 - Shows the result in a Streamlit web UI
 - Generates an Excel workbook download from the web app
 - Displays multi-year trend charts so several companies can be compared side by side
@@ -20,7 +21,24 @@ This version is intentionally narrow:
 - Focus on annual screening
 - Prefer standard `us-gaap` concepts from SEC `companyfacts`
 - Use annual facts for each company across the requested fiscal-year range
-- Show preliminary red flags only
+- Translate balance sheet items with closing USD/KRW rates
+- Translate income statement and cash flow items with average USD/KRW rates
+- Show preliminary red flags and internal rating details
+
+## Internal rating note
+
+The current score conversion is configurable:
+
+- `AAA=100`
+- `AA=95`
+- `A=90`
+- `BB=80`
+- `B=70`
+- `CC=60`
+- `C=50`
+- `D=40`
+
+Some company threshold rows have duplicated bands. Following the current working assumption, duplicated bands use the lower grade. For example, a 300% liabilities/equity band is scored as `BB`.
 
 ## Important note
 
