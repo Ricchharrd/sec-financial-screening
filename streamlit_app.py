@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import altair as alt
+import inspect
 import pandas as pd
 import streamlit as st
 
 from sec_edgar_client import CompanyMatch, search_companies
 from sec_excel_export import workbook_bytes
-from sec_screening import (
-    error_to_row,
-    result_to_flag_rows,
-    result_to_note_rows,
-    result_to_rating_rows,
-    result_to_summary_row,
-    screen_companies,
+import sec_screening
+
+
+error_to_row = sec_screening.error_to_row
+result_to_flag_rows = sec_screening.result_to_flag_rows
+result_to_note_rows = sec_screening.result_to_note_rows
+result_to_summary_row = sec_screening.result_to_summary_row
+screen_companies = sec_screening.screen_companies
+result_to_rating_rows = getattr(sec_screening, "result_to_rating_rows", lambda _result: [])
+SUPPORTS_INTERNAL_RATING = (
+    hasattr(sec_screening, "result_to_rating_rows")
+    and "exchange_rates" in inspect.signature(sec_screening.screen_companies).parameters
 )
 
 
@@ -55,6 +61,12 @@ def build_exchange_rate_inputs(start_year: int, end_year: int) -> dict[int, dict
             raise ValueError("FX rates must be greater than zero.")
         exchange_rates[year] = {"closing": closing, "average": average}
     return exchange_rates
+
+
+def run_screening_with_compatibility(selected_matches, start_year: int, end_year: int, exchange_rates: dict[int, dict[str, float]]):
+    if SUPPORTS_INTERNAL_RATING:
+        return screen_companies(selected_matches, start_year, end_year, exchange_rates)
+    return screen_companies(selected_matches, start_year, end_year)
 
 
 def percent_or_none(value):
@@ -298,6 +310,10 @@ def main():
     st.set_page_config(page_title=APP_TITLE, page_icon=":office_building:", layout="wide")
     st.title(APP_TITLE)
     st.caption("U.S. public company preliminary financial screening tool based on SEC annual filing facts. Not a rating opinion. Human review required.")
+    if not SUPPORTS_INTERNAL_RATING:
+        st.warning(
+            "Internal rating helpers are not available. Update `sec_screening.py` together with `streamlit_app.py` in the deployed repository."
+        )
 
     current_year = 2026
     with st.sidebar:
@@ -365,7 +381,7 @@ def main():
                     with st.status("Running SEC screening...", expanded=True) as status:
                         status.write("1. SEC company matches resolved")
                         status.write("2. Downloading SEC company facts")
-                        results, errors = screen_companies(selected_matches, int(start_year), int(end_year), exchange_rates)
+                        results, errors = run_screening_with_compatibility(selected_matches, int(start_year), int(end_year), exchange_rates)
                         status.write("3. Building multi-year metrics, FX translation, and internal ratings")
                         summary_rows = [result_to_summary_row(result) for result in results]
                         flag_rows = [row for result in results for row in result_to_flag_rows(result)]
