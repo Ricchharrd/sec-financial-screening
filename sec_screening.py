@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import html
+import re
 
-from sec_edgar_client import CompanyMatch, fetch_company_facts
+from sec_edgar_client import CompanyMatch, fetch_company_facts, fetch_filing_document_html
 
 
 ANNUAL_FORMS = {"10-K", "20-F", "40-F"}
@@ -184,6 +186,45 @@ def _is_target_annual_row(row: dict, fiscal_year: int) -> bool:
     return not fp or fp == "FY"
 
 
+def _normalize_fact_text(value: str | None) -> str:
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(value or ""))
+    text = re.sub(r"[^a-zA-Z0-9]+", " ", text)
+    return " ".join(text.lower().split())
+
+
+def _interest_expense_relevance(taxonomy: str, concept_name: str, concept_map: dict) -> int:
+    name_label = _normalize_fact_text(f"{taxonomy} {concept_name} {concept_map.get('label') or ''}")
+    description = _normalize_fact_text(concept_map.get("description") or "")
+    searchable = f"{name_label} {description}"
+
+    if "interest expense excluding financial products" in name_label:
+        return 100
+    if "interest expense excluding financial" in name_label:
+        return 95
+    if "interest expense excluding financial products" in description:
+        return 80
+    if "interest expense of financial products" in searchable:
+        return 0
+    if "interest expense" not in name_label:
+        return 0
+
+    excluded_terms = [
+        "interest income",
+        "interest earned",
+        "interest rate",
+        "gain",
+        "loss",
+        "derivative",
+        "notional",
+        "fair value",
+        "capitalized",
+        "tax",
+    ]
+    if any(term in searchable for term in excluded_terms):
+        return 0
+    return 50
+
+
 def annual_years_available(company_facts: dict) -> list[int]:
     years = set()
     for taxonomy_map in (company_facts.get("facts") or {}).values():
@@ -230,6 +271,85 @@ def pick_first_annual_fact(company_facts: dict, concept_options: list[tuple[str,
     return None
 
 
+def pick_interest_expense_fallback(company_facts: dict, fiscal_year: int) -> dict | None:
+    candidates: list[tuple[tuple, dict]] = []
+    for taxonomy, concept_map_by_name in (company_facts.get("facts") or {}).items():
+        for concept_name, concept_map in concept_map_by_name.items():
+            relevance = _interest_expense_relevance(str(taxonomy), str(concept_name), concept_map)
+            if relevance <= 0:
+                continue
+            for unit_name, rows in (concept_map.get("units") or {}).items():
+                for row in rows:
+                    if not _is_target_annual_row(row, fiscal_year):
+                        continue
+                    end = str(row.get("end") or "")
+                    filed = str(row.get("filed") or "")
+                    score = (relevance, end, _annual_duration_score(row), filed, -_unit_priority(unit_name))
+                    enriched = dict(row)
+                    enriched["unit"] = unit_name
+                    enriched["concept"] = f"{taxonomy}:{concept_name}"
+                    enriched["custom_label"] = concept_map.get("label")
+                    candidates.append((score, enriched))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _parse_amount_millions(value: str) -> float | None:
+    cleaned = str(value or "").strip().replace("$", "").replace(",", "")
+    if not cleaned:
+        return None
+    is_negative = cleaned.startswith("(") and cleaned.endswith(")")
+    cleaned = cleaned.strip("()")
+    try:
+        amount = float(cleaned) * 1_000_000
+    except ValueError:
+        return None
+    return -amount if is_negative else amount
+
+
+def parse_interest_expense_from_filing_html(html_text: str, fiscal_year: int) -> float | None:
+    text = html.unescape(re.sub(r"<[^>]+>", " ", html_text or ""))
+    text = re.sub(r"\s+", " ", text)
+    pattern = re.compile(
+        rf"interest expense excluding financial products\s+in\s+{int(fiscal_year)}\s+was\s+\$?\s*([()]?[\d,]+(?:\.\d+)?[()]?)\s+million",
+        re.IGNORECASE,
+    )
+    match = pattern.search(text)
+    if not match:
+        return None
+    return _parse_amount_millions(match.group(1))
+
+
+def accession_for_year(company_facts: dict, fiscal_year: int) -> str | None:
+    for taxonomy, concept in (
+        CONCEPTS["revenue"]
+        + CONCEPTS["operating_income"]
+        + CONCEPTS["net_income"]
+        + CONCEPTS["operating_cash_flow"]
+    ):
+        matched_fact = pick_annual_fact(company_facts, taxonomy, concept, fiscal_year)
+        if matched_fact and matched_fact.get("accn"):
+            return str(matched_fact.get("accn"))
+    return None
+
+
+def pick_interest_expense_from_filing_html(company_facts: dict, cik: str, fiscal_year: int) -> tuple[float | None, str]:
+    accession = accession_for_year(company_facts, fiscal_year)
+    if not accession:
+        return None, "No annual filing accession found for raw 10-K interest expense fallback."
+    try:
+        html_text = fetch_filing_document_html(cik, accession)
+        value = parse_interest_expense_from_filing_html(html_text, fiscal_year)
+    except Exception as exc:
+        return None, f"Raw 10-K interest expense fallback failed for accession {accession}: {exc}"
+    if value is None:
+        return None, f"Raw 10-K fallback did not find 'interest expense excluding Financial Products' in accession {accession}."
+    return value, f"Parsed raw 10-K text fallback: Interest expense excluding Financial Products ({accession})."
+
+
 def extract_financial_debt(company_facts: dict, fiscal_year: int) -> tuple[float | None, str]:
     total = 0.0
     matched = []
@@ -249,7 +369,7 @@ def extract_financial_debt(company_facts: dict, fiscal_year: int) -> tuple[float
     return None, f"No standard annual SEC financial debt fact matched for FY{fiscal_year}."
 
 
-def extract_metrics_for_year(company_facts: dict, fiscal_year: int) -> tuple[dict, dict]:
+def extract_metrics_for_year(company_facts: dict, fiscal_year: int, cik: str | None = None) -> tuple[dict, dict]:
     metrics = {}
     notes = {}
     for metric_key, concept_options in CONCEPTS.items():
@@ -264,6 +384,23 @@ def extract_metrics_for_year(company_facts: dict, fiscal_year: int) -> tuple[dic
     financial_debt, debt_note = extract_financial_debt(company_facts, fiscal_year)
     metrics["financial_debt"] = financial_debt
     notes["financial_debt"] = debt_note
+
+    if metrics.get("interest_expense") is None:
+        fallback = pick_interest_expense_fallback(company_facts, fiscal_year)
+        if fallback:
+            metrics["interest_expense"] = fallback.get("val")
+            label = fallback.get("custom_label") or "-"
+            notes["interest_expense"] = (
+                f"Matched custom annual interest expense fallback {fallback.get('concept')} "
+                f"({label}, {fallback.get('form')}, FY{fallback.get('fy')})."
+            )
+        elif cik:
+            raw_value, raw_note = pick_interest_expense_from_filing_html(company_facts, cik, fiscal_year)
+            if raw_value is not None:
+                metrics["interest_expense"] = raw_value
+                notes["interest_expense"] = raw_note
+            else:
+                notes["interest_expense"] = f"{notes['interest_expense']} {raw_note}"
 
     metrics["interest_expense_abs"] = clean_abs(metrics.get("interest_expense"))
     metrics["debt_ratio"] = safe_div(metrics.get("total_liabilities"), metrics.get("total_equity"))
@@ -609,7 +746,7 @@ def build_red_flags(metrics: dict) -> list[str]:
 
 
 def screen_company_year(match: CompanyMatch, company_facts: dict, fiscal_year: int) -> ScreeningResult:
-    metrics, notes = extract_metrics_for_year(company_facts, fiscal_year)
+    metrics, notes = extract_metrics_for_year(company_facts, fiscal_year, cik=match.cik)
     filing_meta = infer_filing_meta_for_year(company_facts, fiscal_year)
     return ScreeningResult(
         company_name=match.company_name,

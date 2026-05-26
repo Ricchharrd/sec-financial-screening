@@ -23,6 +23,7 @@ This version is intentionally narrow:
 - Use annual facts for each company across the requested fiscal-year range
 - Translate balance sheet items with closing USD/KRW rates
 - Translate income statement and cash flow items with average USD/KRW rates
+- Falls back to raw 10-K text for selected interest expense lines that are not exposed through SEC `companyfacts`
 - Show preliminary red flags and internal rating details
 
 ## FX rates
@@ -109,5 +110,5 @@ dist\SECFinancialScreening.exe
 - add 10-Q support
 - add Excel export
 - add peer comparison tables
-- add more robust concept fallbacks for interest expense and debt
+- add more robust concept fallbacks for debt
 - add cached company lookup and request throttling
