@@ -36,6 +36,8 @@ CONCEPTS = {
         ("us-gaap", "Revenues"),
         ("us-gaap", "SalesRevenueNet"),
         ("us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax"),
+        ("us-gaap", "RevenueFromContractWithCustomerIncludingAssessedTax"),
+        ("us-gaap", "RevenueFromContractWithCustomer"),
     ],
     "net_income": [
         ("us-gaap", "NetIncomeLoss"),
