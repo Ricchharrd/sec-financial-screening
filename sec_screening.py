@@ -315,14 +315,23 @@ def _parse_amount_millions(value: str) -> float | None:
 def parse_interest_expense_from_filing_html(html_text: str, fiscal_year: int) -> float | None:
     text = html.unescape(re.sub(r"<[^>]+>", " ", html_text or ""))
     text = re.sub(r"\s+", " ", text)
-    pattern = re.compile(
+    sentence_pattern = re.compile(
         rf"interest expense excluding financial products\s+in\s+{int(fiscal_year)}\s+was\s+\$?\s*([()]?[\d,]+(?:\.\d+)?[()]?)\s+million",
         re.IGNORECASE,
     )
-    match = pattern.search(text)
-    if not match:
-        return None
-    return _parse_amount_millions(match.group(1))
+    sentence_match = sentence_pattern.search(text)
+    if sentence_match:
+        return _parse_amount_millions(sentence_match.group(1))
+
+    other_income_pattern = re.compile(
+        rf"detail of other income/\(expense\), net for\s+{int(fiscal_year)}.*?interest expense\s+\(?\s*\$?\s*([()]?[\d,]+(?:\.\d+)?[()]?)\s*\)?",
+        re.IGNORECASE,
+    )
+    other_income_match = other_income_pattern.search(text)
+    if other_income_match:
+        return _parse_amount_millions(other_income_match.group(1))
+
+    return None
 
 
 def accession_for_year(company_facts: dict, fiscal_year: int) -> str | None:
@@ -348,8 +357,8 @@ def pick_interest_expense_from_filing_html(company_facts: dict, cik: str, fiscal
     except Exception as exc:
         return None, f"Raw 10-K interest expense fallback failed for accession {accession}: {exc}"
     if value is None:
-        return None, f"Raw 10-K fallback did not find 'interest expense excluding Financial Products' in accession {accession}."
-    return value, f"Parsed raw 10-K text fallback: Interest expense excluding Financial Products ({accession})."
+        return None, f"Raw 10-K fallback did not find a separately disclosed interest expense amount in accession {accession}."
+    return value, f"Parsed raw 10-K text fallback for separately disclosed interest expense ({accession})."
 
 
 def extract_financial_debt(company_facts: dict, fiscal_year: int) -> tuple[float | None, str]:
@@ -615,6 +624,17 @@ def build_company_rating(
     financial_debt_to_op = safe_div(financial_debt_krw, operating_income_krw)
     ocf_to_debt = safe_div(operating_cf_krw, financial_debt_krw)
     interest_coverage = safe_div(operating_income_krw, interest_expense_krw)
+    interest_coverage_grade = grade_higher_better(
+        interest_coverage,
+        [("AAA", 20), ("AA", 15), ("A", 10), ("BB", 5), ("B", 2.25), ("CC", 1), ("C", 0.5)],
+    )
+    interest_coverage_note = ""
+    if interest_coverage is None and result.metrics.get("interest_expense_abs") is None and operating_income_krw is not None:
+        interest_coverage_grade = "AAA"
+        interest_coverage_note = (
+            "Interest expense is not separately disclosed in SEC facts/raw 10-K; "
+            "scored AAA per current working rule, not by treating interest expense as zero."
+        )
 
     components = [
         component(
@@ -643,11 +663,9 @@ def build_company_rating(
             "interest_coverage",
             "Interest Coverage",
             interest_coverage,
-            grade_higher_better(
-                interest_coverage,
-                [("AAA", 20), ("AA", 15), ("A", 10), ("BB", 5), ("B", 2.25), ("CC", 1), ("C", 0.5)],
-            ),
+            interest_coverage_grade,
             RATING_WEIGHTS["interest_coverage"],
+            interest_coverage_note,
         ),
         component(
             "financial_debt_to_operating_income",

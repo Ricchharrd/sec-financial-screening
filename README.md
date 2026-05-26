@@ -25,6 +25,7 @@ This version is intentionally narrow:
 - Translate income statement and cash flow items with average USD/KRW rates
 - Falls back to raw 10-K text for selected interest expense lines that are not exposed through SEC `companyfacts`
 - Show preliminary red flags and internal rating details
+- If interest expense is not separately disclosed, the interest coverage component is scored as `AAA` by working rule without treating interest expense as zero
 
 ## FX rates
 
