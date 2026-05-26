@@ -56,6 +56,7 @@ def write_screening_workbook(
     note_rows: list[dict],
     output_path: Path,
     rating_rows: list[dict] | None = None,
+    fx_rows: list[dict] | None = None,
 ):
     try:
         from openpyxl import Workbook
@@ -98,6 +99,9 @@ def write_screening_workbook(
         amount_columns={"Value", "Points", "Weighted Points"},
     )
 
+    fx_ws = wb.create_sheet("FX Rates")
+    append_sheet(fx_ws, fx_rows or [])
+
     notes_ws = wb.create_sheet("Notes")
     append_sheet(notes_ws, note_rows)
 
@@ -110,6 +114,7 @@ def workbook_bytes(
     note_rows: list[dict],
     error_rows: list[dict],
     rating_rows: list[dict] | None = None,
+    fx_rows: list[dict] | None = None,
 ) -> bytes:
     import tempfile
 
@@ -120,7 +125,7 @@ def workbook_bytes(
         except ImportError as exc:
             raise RuntimeError("Excel export requires openpyxl. Install it with pip.") from exc
 
-        write_screening_workbook(summary_rows, flag_rows, note_rows, output_path, rating_rows=rating_rows)
+        write_screening_workbook(summary_rows, flag_rows, note_rows, output_path, rating_rows=rating_rows, fx_rows=fx_rows)
         wb = load_workbook(output_path)
         if error_rows:
             errors_ws = wb.create_sheet("Errors")

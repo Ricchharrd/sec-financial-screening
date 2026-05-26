@@ -44,7 +44,10 @@ CONCEPTS = {
     "interest_expense": [
         ("us-gaap", "InterestExpenseNonOperating"),
         ("us-gaap", "InterestExpense"),
+        ("us-gaap", "InterestExpenseDebt"),
         ("us-gaap", "InterestAndDebtExpense"),
+        ("us-gaap", "FinanceLeaseInterestExpense"),
+        ("us-gaap", "InterestExpenseBorrowings"),
     ],
     "total_assets": [
         ("us-gaap", "Assets"),
@@ -107,6 +110,8 @@ class ScreeningResult:
     fiscal_period: str
     form: str
     filed: str
+    period_start: str | None
+    period_end: str | None
     metrics: dict
     notes: dict
     red_flags: list[str]
@@ -250,6 +255,8 @@ def extract_metrics_for_year(company_facts: dict, fiscal_year: int) -> tuple[dic
 
 def infer_filing_meta_for_year(company_facts: dict, fiscal_year: int) -> dict:
     latest = None
+    starts = []
+    ends = []
     for taxonomy_map in (company_facts.get("facts") or {}).values():
         for concept_map in taxonomy_map.values():
             for unit_rows in (concept_map.get("units") or {}).values():
@@ -261,15 +268,25 @@ def infer_filing_meta_for_year(company_facts: dict, fiscal_year: int) -> dict:
                         continue
                     if fp and fp != "FY":
                         continue
+                    if row.get("start"):
+                        starts.append(str(row.get("start")))
+                    if row.get("end"):
+                        ends.append(str(row.get("end")))
                     candidate = {
                         "fiscal_year": int(fy),
                         "fiscal_period": fp or "FY",
                         "form": form,
                         "filed": str(row.get("filed") or ""),
+                        "period_start": str(row.get("start") or ""),
+                        "period_end": str(row.get("end") or ""),
                     }
                     if latest is None or candidate["filed"] > latest["filed"]:
                         latest = candidate
-    return latest or {"fiscal_year": fiscal_year, "fiscal_period": "FY", "form": "-", "filed": "-"}
+    if latest:
+        latest["period_start"] = min(starts) if starts else latest.get("period_start") or None
+        latest["period_end"] = max(ends) if ends else latest.get("period_end") or None
+        return latest
+    return {"fiscal_year": fiscal_year, "fiscal_period": "FY", "form": "-", "filed": "-", "period_start": None, "period_end": None}
 
 
 def final_grade(score: float | None) -> str | None:
@@ -376,10 +393,14 @@ def component(metric_key: str, label: str, value, grade: str | None, weight: flo
 def build_company_rating(
     result: ScreeningResult,
     prior_result: ScreeningResult | None,
-    exchange_rates: dict[int, dict[str, float]],
+    exchange_rates: dict,
 ) -> dict:
-    rates = exchange_rates.get(result.fiscal_year, {})
-    prior_rates = exchange_rates.get(prior_result.fiscal_year, {}) if prior_result else {}
+    rates = exchange_rates.get((result.cik, result.fiscal_year), exchange_rates.get(result.fiscal_year, {}))
+    prior_rates = (
+        exchange_rates.get((prior_result.cik, prior_result.fiscal_year), exchange_rates.get(prior_result.fiscal_year, {}))
+        if prior_result
+        else {}
+    )
     closing_rate = rates.get("closing")
     average_rate = rates.get("average")
     prior_closing_rate = prior_rates.get("closing")
@@ -493,6 +514,10 @@ def build_company_rating(
         "exchange_rates": {
             "closing": closing_rate,
             "average": average_rate,
+            "closing_date": rates.get("closing_date"),
+            "average_start": rates.get("average_start"),
+            "average_end": rates.get("average_end"),
+            "source": rates.get("source"),
         },
         "translated_metrics": {
             "revenue_mil_krw": revenue_mil,
@@ -549,6 +574,8 @@ def screen_company_year(match: CompanyMatch, company_facts: dict, fiscal_year: i
         fiscal_period=filing_meta["fiscal_period"],
         form=filing_meta["form"],
         filed=filing_meta["filed"],
+        period_start=filing_meta.get("period_start"),
+        period_end=filing_meta.get("period_end"),
         metrics=metrics,
         notes=notes,
         red_flags=build_red_flags(metrics),
@@ -633,6 +660,8 @@ def result_to_summary_row(result: ScreeningResult) -> dict:
         "Fiscal Year": result.fiscal_year,
         "Form": result.form,
         "Filed": result.filed,
+        "Period Start": result.period_start,
+        "Period End": result.period_end,
         "Revenue": result.metrics.get("revenue"),
         "Operating Income": result.metrics.get("operating_income"),
         "Net Income": result.metrics.get("net_income"),
@@ -654,6 +683,8 @@ def result_to_summary_row(result: ScreeningResult) -> dict:
         "Working Capital": result.metrics.get("working_capital"),
         "Internal Score": result.rating.get("weighted_score") if result.rating else None,
         "Internal Grade": result.rating.get("final_grade") if result.rating else None,
+        "Closing USD/KRW": result.rating.get("exchange_rates", {}).get("closing") if result.rating else None,
+        "Average USD/KRW": result.rating.get("exchange_rates", {}).get("average") if result.rating else None,
         "Red Flag Count": len(result.red_flags),
     }
 
