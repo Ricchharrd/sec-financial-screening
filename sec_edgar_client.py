@@ -11,6 +11,8 @@ SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 TICKER_LIST_URL = "https://www.sec.gov/files/company_tickers.json"
 DEFAULT_USER_AGENT = "SEC Financial Screening MVP contact@example.com"
+REQUEST_TIMEOUT_SECONDS = 75
+REQUEST_RETRIES = 3
 
 
 @dataclass
@@ -26,16 +28,24 @@ def get_user_agent() -> str:
     return os.getenv("SEC_USER_AGENT", DEFAULT_USER_AGENT)
 
 
-def req_get_json(url: str, timeout: int = 30) -> dict:
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": get_user_agent(),
-            "Accept": "application/json",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+def req_get_json(url: str, timeout: int = REQUEST_TIMEOUT_SECONDS) -> dict:
+    last_error = None
+    for attempt in range(REQUEST_RETRIES):
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": get_user_agent(),
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            last_error = exc
+            if attempt < REQUEST_RETRIES - 1:
+                time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"Request failed after {REQUEST_RETRIES} attempts: {url} ({last_error})") from last_error
 
 
 def normalize_name(name: str) -> str:

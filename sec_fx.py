@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import csv
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from functools import lru_cache
 from io import StringIO
+import time
+import urllib.parse
 import urllib.request
 
 
-FRED_DEXKOUS_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DEXKOUS"
 FX_SOURCE_LABEL = "FRED DEXKOUS, KRW per 1 USD"
+REQUEST_TIMEOUT_SECONDS = 75
+REQUEST_RETRIES = 3
 
 
 def parse_date(value: str | None) -> date | None:
@@ -17,14 +20,36 @@ def parse_date(value: str | None) -> date | None:
     return datetime.strptime(value, "%Y-%m-%d").date()
 
 
-@lru_cache(maxsize=1)
-def load_usd_krw_rates() -> tuple[tuple[date, float], ...]:
-    request = urllib.request.Request(
-        FRED_DEXKOUS_CSV_URL,
-        headers={"User-Agent": "SEC Financial Screening FX loader"},
-    )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        text = response.read().decode("utf-8")
+def fred_csv_url(start_date: date, end_date: date) -> str:
+    params = {
+        "id": "DEXKOUS",
+        "observation_start": start_date.isoformat(),
+        "observation_end": end_date.isoformat(),
+    }
+    return "https://fred.stlouisfed.org/graph/fredgraph.csv?" + urllib.parse.urlencode(params)
+
+
+def read_url_text(url: str) -> str:
+    last_error = None
+    for attempt in range(REQUEST_RETRIES):
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "SEC Financial Screening FX loader"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+                return response.read().decode("utf-8")
+        except Exception as exc:
+            last_error = exc
+            if attempt < REQUEST_RETRIES - 1:
+                time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"Could not load FRED USD/KRW rates after {REQUEST_RETRIES} attempts: {last_error}") from last_error
+
+
+@lru_cache(maxsize=16)
+def load_usd_krw_rates(start_date: date, end_date: date) -> tuple[tuple[date, float], ...]:
+    url = fred_csv_url(start_date, end_date)
+    text = read_url_text(url)
 
     rows: list[tuple[date, float]] = []
     for row in csv.DictReader(StringIO(text)):
@@ -62,10 +87,14 @@ def fiscal_period_from_result(result) -> tuple[date, date]:
 
 
 def build_exchange_rates_for_results(results) -> dict[tuple[str, int], dict[str, float | str]]:
-    rates = load_usd_krw_rates()
+    periods = [fiscal_period_from_result(result) for result in results]
+    if not periods:
+        return {}
+    min_start = min(start for start, _end in periods) - timedelta(days=10)
+    max_end = max(end for _start, end in periods)
+    rates = load_usd_krw_rates(min_start, max_end)
     exchange_rates = {}
-    for result in results:
-        start_date, end_date = fiscal_period_from_result(result)
+    for result, (start_date, end_date) in zip(results, periods):
         closing_date, closing = rate_on_or_before(end_date, rates)
         average = average_rate(start_date, end_date, rates)
         exchange_rates[(result.cik, int(result.fiscal_year))] = {
