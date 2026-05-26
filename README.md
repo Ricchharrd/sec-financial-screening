@@ -9,7 +9,7 @@ This folder contains a separate U.S. SEC / EDGAR-based screening tool.
 - Lets the user choose the matched company when there are multiple candidates
 - Pulls public company facts from SEC EDGAR `submissions` and `companyfacts`
 - Calculates a small set of preliminary screening metrics across a selected year range
-- Applies the internal financial capability rating grid using user-entered USD/KRW rates
+- Applies the internal financial capability rating grid using built-in USD/KRW rates
 - Shows the result in a Streamlit web UI
 - Generates an Excel workbook download from the web app
 - Displays multi-year trend charts so several companies can be compared side by side
@@ -24,6 +24,10 @@ This version is intentionally narrow:
 - Translate balance sheet items with closing USD/KRW rates
 - Translate income statement and cash flow items with average USD/KRW rates
 - Show preliminary red flags and internal rating details
+
+## FX rates
+
+The Streamlit app does not call FRED at runtime. It uses a hardcoded USD/KRW table for FY2020-FY2025, based on FRED annual average `AEXKOUS` and year-end or last-observed daily `DEXKOUS` rates.
 
 ## Internal rating note
 

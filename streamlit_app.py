@@ -8,7 +8,7 @@ import streamlit as st
 from sec_edgar_client import CompanyMatch, search_companies
 from sec_excel_export import workbook_bytes
 import sec_screening
-from sec_fx import build_exchange_rates_for_results, exchange_rate_rows
+from sec_fx import build_exchange_rates_for_results, exchange_rate_rows, max_fx_year, min_fx_year
 
 
 error_to_row = sec_screening.error_to_row
@@ -369,13 +369,16 @@ def main():
             "Internal rating helpers are not available. Update `sec_screening.py` together with `streamlit_app.py` in the deployed repository."
         )
 
-    current_year = 2026
+    fx_min_year = min_fx_year()
+    fx_max_year = max_fx_year()
+    default_start_year = max(fx_min_year, fx_max_year - 2)
     with st.sidebar:
         st.header("Input")
         default_queries = "MSFT\nAAPL\nNVDA\nCAT"
         query_text = st.text_area("Tickers or company names", value=default_queries, height=180, help="Enter multiple tickers or company names separated by commas or line breaks.")
-        start_year = st.number_input("Start year", min_value=2000, max_value=current_year, value=current_year - 2, step=1)
-        end_year = st.number_input("End year", min_value=2000, max_value=current_year, value=current_year, step=1)
+        st.caption(f"Built-in USD/KRW rates are available for FY{fx_min_year}-FY{fx_max_year}.")
+        start_year = st.number_input("Start year", min_value=fx_min_year, max_value=fx_max_year, value=default_start_year, step=1)
+        end_year = st.number_input("End year", min_value=fx_min_year, max_value=fx_max_year, value=fx_max_year, step=1)
         preview_button = st.button("Preview SEC matches", width="stretch")
         run_button = st.button("Run screening", type="primary", width="stretch")
 
@@ -431,7 +434,7 @@ def main():
                         status.write("1. SEC company matches resolved")
                         status.write("2. Downloading SEC company facts")
                         results, errors = run_screening_with_compatibility(selected_matches, int(start_year), int(end_year))
-                        status.write("3. Loading historical FX rates and building internal ratings")
+                        status.write("3. Applying built-in historical FX rates and building internal ratings")
                         exchange_rates = apply_auto_fx_and_ratings(results)
                         summary_rows = [result_to_summary_row(result) for result in results]
                         flag_rows = [row for result in results for row in result_to_flag_rows(result)]
@@ -472,7 +475,7 @@ def main():
             - It focuses on annual facts from `10-K`, `20-F`, and `40-F`.
             - You can choose the fiscal-year range to screen.
             - Multiple companies are shown as time-series so you can compare their trends.
-            - FX rates are loaded automatically from FRED DEXKOUS and displayed in the result.
+            - FX rates use the built-in USD/KRW table and are displayed in the result.
             - Internal rating amounts are translated to KRW using closing rates for balance sheet items and average rates for income statement / cash flow items.
             - Component grade points currently use AAA=100, AA=95, A=90, BB=80, B=70, CC=60, C=50, D=40.
             - Duplicate threshold bands use the lower grade based on the current working rule.

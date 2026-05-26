@@ -1,79 +1,63 @@
 from __future__ import annotations
 
-import csv
-from datetime import date, datetime, timedelta
-from functools import lru_cache
-from io import StringIO
-import time
-import urllib.parse
-import urllib.request
+from datetime import date, datetime
 
 
-FX_SOURCE_LABEL = "FRED DEXKOUS, KRW per 1 USD"
-REQUEST_TIMEOUT_SECONDS = 75
-REQUEST_RETRIES = 3
+FX_SOURCE_LABEL = "Hardcoded FRED AEXKOUS annual average and DEXKOUS year-end/last observed KRW per 1 USD"
+
+# FRED AEXKOUS provides annual average KRW/USD. FRED DEXKOUS provides daily spot
+# rates; the closing rate below uses Dec. 31 where available, otherwise the last
+# available observation before year-end.
+HARDCODED_USD_KRW_RATES = {
+    2020: {
+        "average": 1180.5554,
+        "closing": 1086.11,
+        "closing_date": "2020-12-31",
+    },
+    2021: {
+        "average": 1144.8911,
+        "closing": 1188.59,
+        "closing_date": "2021-12-30",
+    },
+    2022: {
+        "average": 1291.7796,
+        "closing": 1260.18,
+        "closing_date": "2022-12-30",
+    },
+    2023: {
+        "average": 1306.7637,
+        "closing": 1290.97,
+        "closing_date": "2023-12-29",
+    },
+    2024: {
+        "average": 1363.4381,
+        "closing": 1477.86,
+        "closing_date": "2024-12-31",
+    },
+    2025: {
+        "average": 1421.3963,
+        "closing": 1444.55,
+        "closing_date": "2025-12-31",
+    },
+}
+
+
+def available_fx_years() -> list[int]:
+    return sorted(HARDCODED_USD_KRW_RATES)
+
+
+def min_fx_year() -> int:
+    return min(available_fx_years())
+
+
+def max_fx_year() -> int:
+    return max(available_fx_years())
 
 
 def parse_date(value: str | None) -> date | None:
     if not value:
         return None
     return datetime.strptime(value, "%Y-%m-%d").date()
-
-
-def fred_csv_url(start_date: date, end_date: date) -> str:
-    params = {
-        "id": "DEXKOUS",
-        "observation_start": start_date.isoformat(),
-        "observation_end": end_date.isoformat(),
-    }
-    return "https://fred.stlouisfed.org/graph/fredgraph.csv?" + urllib.parse.urlencode(params)
-
-
-def read_url_text(url: str) -> str:
-    last_error = None
-    for attempt in range(REQUEST_RETRIES):
-        request = urllib.request.Request(
-            url,
-            headers={"User-Agent": "SEC Financial Screening FX loader"},
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-                return response.read().decode("utf-8")
-        except Exception as exc:
-            last_error = exc
-            if attempt < REQUEST_RETRIES - 1:
-                time.sleep(1.5 * (attempt + 1))
-    raise RuntimeError(f"Could not load FRED USD/KRW rates after {REQUEST_RETRIES} attempts: {last_error}") from last_error
-
-
-@lru_cache(maxsize=16)
-def load_usd_krw_rates(start_date: date, end_date: date) -> tuple[tuple[date, float], ...]:
-    url = fred_csv_url(start_date, end_date)
-    text = read_url_text(url)
-
-    rows: list[tuple[date, float]] = []
-    for row in csv.DictReader(StringIO(text)):
-        raw_date = row.get("observation_date")
-        raw_value = row.get("DEXKOUS")
-        if not raw_date or not raw_value or raw_value == ".":
-            continue
-        rows.append((parse_date(raw_date), float(raw_value)))
-    return tuple(item for item in rows if item[0] is not None)
-
-
-def rate_on_or_before(target_date: date, rates: tuple[tuple[date, float], ...]) -> tuple[date, float]:
-    candidates = [item for item in rates if item[0] <= target_date]
-    if not candidates:
-        raise ValueError(f"No USD/KRW rate available on or before {target_date}.")
-    return candidates[-1]
-
-
-def average_rate(start_date: date, end_date: date, rates: tuple[tuple[date, float], ...]) -> float:
-    values = [value for rate_date, value in rates if start_date <= rate_date <= end_date]
-    if not values:
-        _closest_date, closest_rate = rate_on_or_before(end_date, rates)
-        return closest_rate
-    return sum(values) / len(values)
 
 
 def fiscal_period_from_result(result) -> tuple[date, date]:
@@ -86,24 +70,34 @@ def fiscal_period_from_result(result) -> tuple[date, date]:
     return start_date, end_date
 
 
+def fx_for_year(fiscal_year: int) -> dict[str, float | str]:
+    if fiscal_year not in HARDCODED_USD_KRW_RATES:
+        raise ValueError(
+            f"No hardcoded USD/KRW rate is available for FY{fiscal_year}. "
+            f"Available years: {min_fx_year()}-{max_fx_year()}."
+        )
+    rate = HARDCODED_USD_KRW_RATES[fiscal_year]
+    return {
+        "closing": rate["closing"],
+        "average": rate["average"],
+        "closing_date": rate["closing_date"],
+        "source": FX_SOURCE_LABEL,
+    }
+
+
 def build_exchange_rates_for_results(results) -> dict[tuple[str, int], dict[str, float | str]]:
-    periods = [fiscal_period_from_result(result) for result in results]
-    if not periods:
-        return {}
-    min_start = min(start for start, _end in periods) - timedelta(days=10)
-    max_end = max(end for _start, end in periods)
-    rates = load_usd_krw_rates(min_start, max_end)
     exchange_rates = {}
-    for result, (start_date, end_date) in zip(results, periods):
-        closing_date, closing = rate_on_or_before(end_date, rates)
-        average = average_rate(start_date, end_date, rates)
+    for result in results:
+        start_date, end_date = fiscal_period_from_result(result)
+        rate = fx_for_year(int(result.fiscal_year))
         exchange_rates[(result.cik, int(result.fiscal_year))] = {
-            "closing": closing,
-            "average": average,
-            "closing_date": closing_date.isoformat(),
+            "closing": rate["closing"],
+            "average": rate["average"],
+            "closing_date": rate["closing_date"],
             "average_start": start_date.isoformat(),
             "average_end": end_date.isoformat(),
-            "source": FX_SOURCE_LABEL,
+            "source": rate["source"],
+            "basis": "Calendar-year hardcoded FX proxy; not company-specific fiscal period daily average.",
         }
     return exchange_rates
 
@@ -120,6 +114,7 @@ def exchange_rate_rows(exchange_rates: dict[tuple[str, int], dict[str, float | s
                 "Average USD/KRW": rate.get("average"),
                 "Average Period": f"{rate.get('average_start')} ~ {rate.get('average_end')}",
                 "Source": rate.get("source"),
+                "Basis": rate.get("basis"),
             }
         )
     return rows
