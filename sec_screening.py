@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from sec_edgar_client import CompanyMatch, fetch_company_facts
 
@@ -148,6 +149,41 @@ def _unit_priority(unit_name: str) -> int:
     return 9
 
 
+def _parse_sec_date(value: str | None):
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _duration_days(row: dict) -> int | None:
+    start = _parse_sec_date(row.get("start"))
+    end = _parse_sec_date(row.get("end"))
+    if start is None or end is None:
+        return None
+    return (end - start).days
+
+
+def _annual_duration_score(row: dict) -> int:
+    duration = _duration_days(row)
+    if duration is None:
+        return -10_000
+    return -abs(duration - 365)
+
+
+def _is_target_annual_row(row: dict, fiscal_year: int) -> bool:
+    form = str(row.get("form") or "")
+    fy = row.get("fy")
+    fp = str(row.get("fp") or "")
+    if form not in ANNUAL_FORMS:
+        return False
+    if not fy or int(fy) != int(fiscal_year):
+        return False
+    return not fp or fp == "FY"
+
+
 def annual_years_available(company_facts: dict) -> list[int]:
     years = set()
     for taxonomy_map in (company_facts.get("facts") or {}).values():
@@ -169,19 +205,12 @@ def pick_annual_fact(company_facts: dict, taxonomy: str, concept: str, fiscal_ye
 
     for unit_name, rows in units.items():
         for row in rows:
-            form = str(row.get("form") or "")
-            fy = row.get("fy")
-            fp = str(row.get("fp") or "")
             frame = str(row.get("frame") or "")
-            if form not in ANNUAL_FORMS:
-                continue
-            if not fy or int(fy) != int(fiscal_year):
-                continue
-            if fp and fp != "FY":
+            if not _is_target_annual_row(row, fiscal_year):
                 continue
             end = str(row.get("end") or "")
             filed = str(row.get("filed") or "")
-            score = (end, filed, -_unit_priority(unit_name), frame)
+            score = (end, _annual_duration_score(row), filed, -_unit_priority(unit_name), frame)
             enriched = dict(row)
             enriched["unit"] = unit_name
             enriched["concept"] = f"{taxonomy}:{concept}"
@@ -254,38 +283,54 @@ def extract_metrics_for_year(company_facts: dict, fiscal_year: int) -> tuple[dic
 
 
 def infer_filing_meta_for_year(company_facts: dict, fiscal_year: int) -> dict:
+    meta_priority = (
+        CONCEPTS["revenue"]
+        + CONCEPTS["operating_income"]
+        + CONCEPTS["net_income"]
+        + CONCEPTS["operating_cash_flow"]
+        + CONCEPTS["total_assets"]
+        + CONCEPTS["total_liabilities"]
+    )
+    for taxonomy, concept in meta_priority:
+        matched_fact = pick_annual_fact(company_facts, taxonomy, concept, fiscal_year)
+        if matched_fact:
+            return {
+                "fiscal_year": int(matched_fact.get("fy") or fiscal_year),
+                "fiscal_period": str(matched_fact.get("fp") or "FY"),
+                "form": str(matched_fact.get("form") or ""),
+                "filed": str(matched_fact.get("filed") or ""),
+                "period_start": str(matched_fact.get("start") or "") or None,
+                "period_end": str(matched_fact.get("end") or "") or None,
+            }
+
     latest = None
-    starts = []
-    ends = []
-    for taxonomy_map in (company_facts.get("facts") or {}).values():
+    for taxonomy_name, taxonomy_map in (company_facts.get("facts") or {}).items():
+        if taxonomy_name != "us-gaap":
+            continue
         for concept_map in taxonomy_map.values():
             for unit_rows in (concept_map.get("units") or {}).values():
                 for row in unit_rows:
-                    form = str(row.get("form") or "")
-                    fy = row.get("fy")
-                    fp = str(row.get("fp") or "")
-                    if form not in ANNUAL_FORMS or not fy or int(fy) != int(fiscal_year):
+                    if not _is_target_annual_row(row, fiscal_year):
                         continue
-                    if fp and fp != "FY":
-                        continue
-                    if row.get("start"):
-                        starts.append(str(row.get("start")))
-                    if row.get("end"):
-                        ends.append(str(row.get("end")))
                     candidate = {
-                        "fiscal_year": int(fy),
-                        "fiscal_period": fp or "FY",
-                        "form": form,
+                        "fiscal_year": int(row.get("fy") or fiscal_year),
+                        "fiscal_period": str(row.get("fp") or "FY"),
+                        "form": str(row.get("form") or ""),
                         "filed": str(row.get("filed") or ""),
-                        "period_start": str(row.get("start") or ""),
-                        "period_end": str(row.get("end") or ""),
+                        "period_start": str(row.get("start") or "") or None,
+                        "period_end": str(row.get("end") or "") or None,
+                        "duration_score": _annual_duration_score(row),
                     }
-                    if latest is None or candidate["filed"] > latest["filed"]:
-                        latest = candidate
+                    score = (
+                        candidate["period_end"] or "",
+                        candidate["duration_score"],
+                        candidate["filed"],
+                    )
+                    if latest is None or score > latest[0]:
+                        latest = (score, candidate)
     if latest:
-        latest["period_start"] = min(starts) if starts else latest.get("period_start") or None
-        latest["period_end"] = max(ends) if ends else latest.get("period_end") or None
-        return latest
+        latest[1].pop("duration_score", None)
+        return latest[1]
     return {"fiscal_year": fiscal_year, "fiscal_period": "FY", "form": "-", "filed": "-", "period_start": None, "period_end": None}
 
 
