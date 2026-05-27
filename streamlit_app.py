@@ -125,7 +125,7 @@ def build_dashboard_frames(results) -> tuple[pd.DataFrame, pd.DataFrame]:
         severe_count = sum(
             1
             for flag in (result.red_flags or [])
-            if any(token in flag for token in ("200%", "below 1.0x", "negative"))
+            if any(token in flag for token in ("200%", "below 1.0x", "negative", "Altman Z-score"))
         )
         metric_rows.append(
             {
@@ -139,6 +139,10 @@ def build_dashboard_frames(results) -> tuple[pd.DataFrame, pd.DataFrame]:
                 "Net Margin (%)": percent_or_none(result.metrics.get("net_margin")),
                 "ROA (%)": percent_or_none(result.metrics.get("roa")),
                 "Operating Cash Flow ($m)": (result.metrics.get("operating_cash_flow") or 0) / 1_000_000 if result.metrics.get("operating_cash_flow") is not None else None,
+                "Altman Z-Score": result.metrics.get("altman_z_score"),
+                "Altman Z Zone": result.metrics.get("altman_z_zone"),
+                "Internal Base Score": result.rating.get("base_score") if result.rating else None,
+                "Internal Score Adjustment": result.rating.get("score_adjustment_total") if result.rating else None,
                 "Internal Score": result.rating.get("weighted_score") if result.rating else None,
                 "Internal Grade": result.rating.get("final_grade") if result.rating else None,
             }
@@ -196,13 +200,19 @@ def render_rating_sheet_for_company(company_results):
             row[str(result.fiscal_year)] = matching[0]["grade"] if matching else "-"
         rows.append(row)
 
-    score_row = {"Area": "", "Evaluation Item": "Final score", "Detail": ""}
+    base_score_row = {"Area": "", "Evaluation Item": "Base score", "Detail": "Before score adjustments"}
+    adjustment_row = {"Area": "", "Evaluation Item": "Score adjustment", "Detail": "Altman Z < 1 and two-year negative OCF/net income deductions"}
+    score_row = {"Area": "", "Evaluation Item": "Final score", "Detail": "After score adjustments"}
     grade_row = {"Area": "", "Evaluation Item": "Final grade", "Detail": ""}
     for result in company_results:
+        base_score = result.rating.get("base_score") if result.rating else None
+        adjustment = result.rating.get("score_adjustment_total") if result.rating else None
         score = result.rating.get("weighted_score") if result.rating else None
+        base_score_row[str(result.fiscal_year)] = round(base_score, 1) if base_score is not None else "-"
+        adjustment_row[str(result.fiscal_year)] = round(adjustment, 1) if adjustment is not None else "-"
         score_row[str(result.fiscal_year)] = round(score, 1) if score is not None else "-"
         grade_row[str(result.fiscal_year)] = result.rating.get("final_grade", "-") if result.rating else "-"
-    rows.extend([score_row, grade_row])
+    rows.extend([base_score_row, adjustment_row, score_row, grade_row])
 
     df = pd.DataFrame(rows)
     st.dataframe(df, width="stretch", hide_index=True)
@@ -261,7 +271,7 @@ def render_dashboard(results):
                 x=alt.X("Fiscal Year:O", title="Fiscal Year"),
                 y=alt.Y("Internal Score:Q", title="Internal Score", scale=alt.Scale(domain=[0, 100])),
                 color=alt.Color("Company:N", title="Company"),
-                tooltip=["Company", "Ticker", "Fiscal Year", "Internal Score", "Internal Grade"],
+                tooltip=["Company", "Ticker", "Fiscal Year", "Internal Base Score", "Internal Score Adjustment", "Internal Score", "Internal Grade"],
             ).properties(height=340, title="Internal rating score trend")
             st.altair_chart(score_chart, use_container_width=True)
 
@@ -276,6 +286,16 @@ def render_dashboard(results):
             line_chart(metric_df, "Liabilities / Equity (%)", "Liabilities / equity trend", "Liabilities / Equity (%)", "#d35400")
         with c4:
             line_chart(metric_df, "Operating Cash Flow ($m)", "Operating cash flow trend", "Operating Cash Flow ($m)", "#6c5ce7")
+
+        altman_df = metric_df.dropna(subset=["Altman Z-Score"])
+        if not altman_df.empty:
+            z_chart = alt.Chart(altman_df).mark_line(point=True, strokeWidth=3).encode(
+                x=alt.X("Fiscal Year:O", title="Fiscal Year"),
+                y=alt.Y("Altman Z-Score:Q", title="Altman Z-Score"),
+                color=alt.Color("Company:N", title="Company"),
+                tooltip=["Company", "Ticker", "Fiscal Year", "Altman Z-Score", "Altman Z Zone"],
+            ).properties(height=320, title="Altman Z-score trend")
+            st.altair_chart(z_chart, use_container_width=True)
 
     with tab2:
         if flag_df.empty:
@@ -476,6 +496,8 @@ def main():
             - You can choose the fiscal-year range to screen.
             - Multiple companies are shown as time-series so you can compare their trends.
             - FX rates use the built-in USD/KRW table and are displayed in the result.
+            - Company-policy Altman Z-score applies the original public-manufacturing formula uniformly, with book equity as the X4 proxy.
+            - Score adjustments deduct 2 points for Altman Z-score below 1.0 and 2 points maximum for two-year consecutive negative operating cash flow or net income.
             - Internal rating amounts are translated to KRW using closing rates for balance sheet items and average rates for income statement / cash flow items.
             - Component grade points currently use AAA=100, AA=95, A=90, BB=80, B=70, CC=60, C=50, D=40.
             - Duplicate threshold bands use the lower grade based on the current working rule.

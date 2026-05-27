@@ -24,12 +24,29 @@ This version is intentionally narrow:
 - Translate balance sheet items with closing USD/KRW rates
 - Translate income statement and cash flow items with average USD/KRW rates
 - Falls back to raw 10-K text for selected interest expense lines that are not exposed through SEC `companyfacts`
+- Adds company-policy Altman Z-score screening using the original formula uniformly
 - Show preliminary red flags and internal rating details
 - If interest expense is not separately disclosed, the interest coverage component is scored as `AAA` by working rule without treating interest expense as zero
 
 ## FX rates
 
 The Streamlit app does not call FRED at runtime. It uses a hardcoded USD/KRW table for FY2020-FY2025, based on FRED annual average `AEXKOUS` and year-end or last-observed daily `DEXKOUS` rates.
+
+## Altman Z-score note
+
+SEC `submissions` metadata provides `sic` and `sicDescription`, which the app displays for industry context. The current company-policy rule applies the original public-manufacturing Altman formula uniformly to all companies:
+
+```text
+Z = 1.2 * X1 + 1.4 * X2 + 3.3 * X3 + 0.6 * X4 + 0.99 * X5
+```
+
+Inputs are X1 working capital / assets, X2 retained earnings / assets, X3 operating income as EBIT proxy / assets, X4 book equity / liabilities, and X5 revenue / assets. The original public manufacturing model uses market value of equity for X4, but SEC `companyfacts` does not provide market capitalization, so this MVP uses book equity as the X4 proxy.
+
+Score adjustments are applied after the weighted component score:
+
+- Altman Z-score below `1.0`: `-2` points
+- Two-year consecutive negative operating cash flow or net income: `-2` points maximum
+- Construction-price bonus: not applied because no construction estimate input is available
 
 ## Internal rating note
 

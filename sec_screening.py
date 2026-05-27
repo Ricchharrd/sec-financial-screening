@@ -82,6 +82,10 @@ CONCEPTS = {
     "operating_cash_flow": [
         ("us-gaap", "NetCashProvidedByUsedInOperatingActivities"),
     ],
+    "retained_earnings": [
+        ("us-gaap", "RetainedEarningsAccumulatedDeficit"),
+        ("us-gaap", "AccumulatedDeficit"),
+    ],
 }
 
 FINANCIAL_DEBT_COMPONENTS = {
@@ -111,6 +115,8 @@ class ScreeningResult:
     company_name: str
     ticker: str
     cik: str
+    sic: str | None
+    sic_description: str | None
     fiscal_year: int
     fiscal_period: str
     form: str
@@ -186,6 +192,25 @@ def _is_target_annual_row(row: dict, fiscal_year: int) -> bool:
     if not fy or int(fy) != int(fiscal_year):
         return False
     return not fp or fp == "FY"
+
+
+def sic_as_int(sic: str | None) -> int | None:
+    if not sic:
+        return None
+    digits = "".join(ch for ch in str(sic) if ch.isdigit())
+    if not digits:
+        return None
+    return int(digits)
+
+
+def is_manufacturing_sic(sic: str | None) -> bool:
+    value = sic_as_int(sic)
+    return value is not None and 2000 <= value <= 3999
+
+
+def is_financial_sic(sic: str | None) -> bool:
+    value = sic_as_int(sic)
+    return value is not None and 6000 <= value <= 6799
 
 
 def _normalize_fact_text(value: str | None) -> str:
@@ -361,6 +386,87 @@ def pick_interest_expense_from_filing_html(company_facts: dict, cik: str, fiscal
     return value, f"Parsed raw 10-K text fallback for separately disclosed interest expense ({accession})."
 
 
+def altman_zone(score: float | None, model_key: str | None) -> str | None:
+    if score is None or not model_key:
+        return None
+    if score < 1.0:
+        return "Penalty trigger"
+    return "No penalty"
+
+
+def compute_altman_z(metrics: dict, sic: str | None, sic_description: str | None) -> dict:
+    total_assets = metrics.get("total_assets")
+    total_liabilities = metrics.get("total_liabilities")
+    if total_assets in (None, 0) or total_liabilities in (None, 0):
+        return {
+            "score": None,
+            "model": "N/A",
+            "model_key": None,
+            "zone": None,
+            "note": "Policy Altman Z-score unavailable because total assets or total liabilities are missing.",
+        }
+
+    working_capital = metrics.get("working_capital")
+    retained_earnings = metrics.get("retained_earnings")
+    ebit_proxy = metrics.get("operating_income")
+    book_equity = metrics.get("total_equity")
+    revenue = metrics.get("revenue")
+    missing = [
+        label
+        for label, value in [
+            ("working capital", working_capital),
+            ("retained earnings", retained_earnings),
+            ("operating income / EBIT proxy", ebit_proxy),
+            ("book equity", book_equity),
+            ("revenue", revenue),
+        ]
+        if value is None
+    ]
+    if missing:
+        return {
+            "score": None,
+            "model": "N/A",
+            "model_key": None,
+            "zone": None,
+            "note": "Policy Altman Z-score unavailable because " + ", ".join(missing) + " are missing.",
+        }
+
+    x1 = safe_div(working_capital, total_assets)
+    x2 = safe_div(retained_earnings, total_assets)
+    x3 = safe_div(ebit_proxy, total_assets)
+    x4 = safe_div(book_equity, total_liabilities)
+    x5 = safe_div(revenue, total_assets)
+    if None in (x1, x2, x3, x4, x5):
+        return {
+            "score": None,
+            "model": "N/A",
+            "model_key": None,
+            "zone": None,
+            "note": "Policy Altman Z-score unavailable because one or more ratio inputs could not be calculated.",
+        }
+
+    score = 1.2 * x1 + 1.4 * x2 + 3.3 * x3 + 0.6 * x4 + 0.99 * x5
+    model = "Policy Altman Z (uniform original formula; book-equity proxy)"
+    model_key = "policy_uniform_original"
+
+    return {
+        "score": score,
+        "model": model,
+        "model_key": model_key,
+        "zone": altman_zone(score, model_key),
+        "note": (
+            "Company policy applies the original public-manufacturing Altman formula uniformly. "
+            f"SEC SIC shown for reference: {sic or '-'} ({sic_description or '-'}). "
+            "X4 uses book equity as a market-equity proxy because SEC companyfacts does not provide market capitalization."
+        ),
+        "x1_working_capital_to_assets": x1,
+        "x2_retained_earnings_to_assets": x2,
+        "x3_ebit_proxy_to_assets": x3,
+        "x4_book_equity_to_liabilities": x4,
+        "x5_sales_to_assets": x5,
+    }
+
+
 def extract_financial_debt(company_facts: dict, fiscal_year: int) -> tuple[float | None, str]:
     total = 0.0
     matched = []
@@ -380,7 +486,13 @@ def extract_financial_debt(company_facts: dict, fiscal_year: int) -> tuple[float
     return None, f"No standard annual SEC financial debt fact matched for FY{fiscal_year}."
 
 
-def extract_metrics_for_year(company_facts: dict, fiscal_year: int, cik: str | None = None) -> tuple[dict, dict]:
+def extract_metrics_for_year(
+    company_facts: dict,
+    fiscal_year: int,
+    cik: str | None = None,
+    sic: str | None = None,
+    sic_description: str | None = None,
+) -> tuple[dict, dict]:
     metrics = {}
     notes = {}
     for metric_key, concept_options in CONCEPTS.items():
@@ -389,7 +501,10 @@ def extract_metrics_for_year(company_facts: dict, fiscal_year: int, cik: str | N
             metrics[metric_key] = None
             notes[metric_key] = f"No standard annual SEC fact matched for FY{fiscal_year}."
         else:
-            metrics[metric_key] = matched_fact.get("val")
+            value = matched_fact.get("val")
+            if metric_key == "retained_earnings" and str(matched_fact.get("concept") or "").endswith(":AccumulatedDeficit") and value is not None and value > 0:
+                value = -value
+            metrics[metric_key] = value
             notes[metric_key] = f"Matched {matched_fact.get('concept')} ({matched_fact.get('form')}, FY{matched_fact.get('fy')})."
 
     financial_debt, debt_note = extract_financial_debt(company_facts, fiscal_year)
@@ -427,6 +542,16 @@ def extract_metrics_for_year(company_facts: dict, fiscal_year: int, cik: str | N
         if metrics.get("current_assets") is None or metrics.get("current_liabilities") is None
         else metrics["current_assets"] - metrics["current_liabilities"]
     )
+    altman = compute_altman_z(metrics, sic, sic_description)
+    metrics["altman_z_score"] = altman.get("score")
+    metrics["altman_z_model"] = altman.get("model")
+    metrics["altman_z_zone"] = altman.get("zone")
+    metrics["altman_x1_working_capital_to_assets"] = altman.get("x1_working_capital_to_assets")
+    metrics["altman_x2_retained_earnings_to_assets"] = altman.get("x2_retained_earnings_to_assets")
+    metrics["altman_x3_ebit_proxy_to_assets"] = altman.get("x3_ebit_proxy_to_assets")
+    metrics["altman_x4_book_equity_to_liabilities"] = altman.get("x4_book_equity_to_liabilities")
+    metrics["altman_x5_sales_to_assets"] = altman.get("x5_sales_to_assets")
+    notes["altman_z_score"] = altman.get("note")
     return metrics, notes
 
 
@@ -583,6 +708,51 @@ def component(metric_key: str, label: str, value, grade: str | None, weight: flo
     }
 
 
+def build_score_adjustments(result: ScreeningResult, prior_result: ScreeningResult | None) -> list[dict]:
+    adjustments = []
+    altman_score = result.metrics.get("altman_z_score")
+    if altman_score is not None and altman_score < 1.0:
+        adjustments.append(
+            {
+                "key": "altman_z_below_1",
+                "label": "Altman Z-score < 1.0",
+                "points": -2.0,
+                "note": "Company policy deduction using the uniform original Altman Z-score formula.",
+            }
+        )
+
+    consecutive_ocf_loss = (
+        prior_result is not None
+        and result.metrics.get("operating_cash_flow") is not None
+        and prior_result.metrics.get("operating_cash_flow") is not None
+        and result.metrics["operating_cash_flow"] < 0
+        and prior_result.metrics["operating_cash_flow"] < 0
+    )
+    consecutive_net_loss = (
+        prior_result is not None
+        and result.metrics.get("net_income") is not None
+        and prior_result.metrics.get("net_income") is not None
+        and result.metrics["net_income"] < 0
+        and prior_result.metrics["net_income"] < 0
+    )
+    if consecutive_ocf_loss or consecutive_net_loss:
+        reasons = []
+        if consecutive_ocf_loss:
+            reasons.append("operating cash flow")
+        if consecutive_net_loss:
+            reasons.append("net income")
+        adjustments.append(
+            {
+                "key": "two_year_consecutive_losses",
+                "label": "Two-year consecutive OCF or net loss",
+                "points": -2.0,
+                "note": "Maximum 2-point deduction triggered by consecutive negative " + " and ".join(reasons) + ".",
+            }
+        )
+
+    return adjustments
+
+
 def build_company_rating(
     result: ScreeningResult,
     prior_result: ScreeningResult | None,
@@ -711,7 +881,10 @@ def build_company_rating(
             "Duplicate threshold groups use the lower grade, per user instruction.",
         ),
     ]
-    weighted_score = sum(item["weighted_points"] for item in components)
+    base_score = sum(item["weighted_points"] for item in components)
+    score_adjustments = build_score_adjustments(result, prior_result)
+    adjustment_total = sum(item["points"] for item in score_adjustments)
+    weighted_score = max(0.0, min(100.0, base_score + adjustment_total))
     return {
         "exchange_rates": {
             "closing": closing_rate,
@@ -730,9 +903,16 @@ def build_company_rating(
             "receivable_turnover_days": receivable_turnover_days,
         },
         "components": components,
+        "base_score": base_score,
+        "score_adjustments": score_adjustments,
+        "score_adjustment_total": adjustment_total,
         "weighted_score": weighted_score,
         "final_grade": final_grade(weighted_score),
-        "point_scale_note": "Component grade points are configurable: AAA=100, AA=95, A=90, BB=80, B=70, CC=60, C=50, D=40.",
+        "point_scale_note": (
+            "Component grade points are configurable: AAA=100, AA=95, A=90, BB=80, B=70, CC=60, C=50, D=40. "
+            "Score adjustments: Altman Z-score below 1.0 deducts 2 points; two-year consecutive negative operating cash flow or net income deducts 2 points maximum. "
+            "Construction-price bonus is not applied because no construction estimate input is available."
+        ),
     }
 
 
@@ -750,6 +930,8 @@ def apply_company_ratings(results: list[ScreeningResult], exchange_rates: dict[i
 
 def build_red_flags(metrics: dict) -> list[str]:
     flags = []
+    if metrics.get("altman_z_score") is not None and metrics["altman_z_score"] < 1:
+        flags.append("Preliminary red flag: Altman Z-score is below 1.0.")
     if metrics.get("debt_ratio") is not None and metrics["debt_ratio"] >= 2:
         flags.append("Preliminary red flag: liabilities / equity is 200% or higher.")
     if metrics.get("current_ratio") is not None and metrics["current_ratio"] < 1:
@@ -766,12 +948,20 @@ def build_red_flags(metrics: dict) -> list[str]:
 
 
 def screen_company_year(match: CompanyMatch, company_facts: dict, fiscal_year: int) -> ScreeningResult:
-    metrics, notes = extract_metrics_for_year(company_facts, fiscal_year, cik=match.cik)
+    metrics, notes = extract_metrics_for_year(
+        company_facts,
+        fiscal_year,
+        cik=match.cik,
+        sic=match.sic,
+        sic_description=match.sic_description,
+    )
     filing_meta = infer_filing_meta_for_year(company_facts, fiscal_year)
     return ScreeningResult(
         company_name=match.company_name,
         ticker=match.ticker,
         cik=match.cik,
+        sic=match.sic,
+        sic_description=match.sic_description,
         fiscal_year=fiscal_year,
         fiscal_period=filing_meta["fiscal_period"],
         form=filing_meta["form"],
@@ -859,6 +1049,8 @@ def result_to_summary_row(result: ScreeningResult) -> dict:
         "Company": result.company_name,
         "Ticker": result.ticker,
         "CIK": result.cik,
+        "SIC": result.sic,
+        "SIC Description": result.sic_description,
         "Fiscal Year": result.fiscal_year,
         "Form": result.form,
         "Filed": result.filed,
@@ -867,6 +1059,7 @@ def result_to_summary_row(result: ScreeningResult) -> dict:
         "Revenue": result.metrics.get("revenue"),
         "Operating Income": result.metrics.get("operating_income"),
         "Net Income": result.metrics.get("net_income"),
+        "Retained Earnings": result.metrics.get("retained_earnings"),
         "Total Assets": result.metrics.get("total_assets"),
         "Total Liabilities": result.metrics.get("total_liabilities"),
         "Total Equity": result.metrics.get("total_equity"),
@@ -883,6 +1076,16 @@ def result_to_summary_row(result: ScreeningResult) -> dict:
         "Operating CF / Financial Debt": result.metrics.get("operating_cf_to_financial_debt"),
         "Operating Cash Flow": result.metrics.get("operating_cash_flow"),
         "Working Capital": result.metrics.get("working_capital"),
+        "Altman Z-Score": result.metrics.get("altman_z_score"),
+        "Altman Z Model": result.metrics.get("altman_z_model"),
+        "Altman Z Zone": result.metrics.get("altman_z_zone"),
+        "Altman X1 WC / Assets": result.metrics.get("altman_x1_working_capital_to_assets"),
+        "Altman X2 Retained Earnings / Assets": result.metrics.get("altman_x2_retained_earnings_to_assets"),
+        "Altman X3 EBIT Proxy / Assets": result.metrics.get("altman_x3_ebit_proxy_to_assets"),
+        "Altman X4 Book Equity / Liabilities": result.metrics.get("altman_x4_book_equity_to_liabilities"),
+        "Altman X5 Sales / Assets": result.metrics.get("altman_x5_sales_to_assets"),
+        "Internal Base Score": result.rating.get("base_score") if result.rating else None,
+        "Internal Score Adjustment": result.rating.get("score_adjustment_total") if result.rating else None,
         "Internal Score": result.rating.get("weighted_score") if result.rating else None,
         "Internal Grade": result.rating.get("final_grade") if result.rating else None,
         "Closing USD/KRW": result.rating.get("exchange_rates", {}).get("closing") if result.rating else None,
@@ -908,6 +1111,21 @@ def result_to_rating_rows(result: ScreeningResult) -> list[dict]:
                 "Points": item["points"],
                 "Weighted Points": item["weighted_points"],
                 "Note": item["note"],
+            }
+        )
+    for adjustment in result.rating.get("score_adjustments", []):
+        rows.append(
+            {
+                "Company": result.company_name,
+                "Ticker": result.ticker,
+                "Fiscal Year": result.fiscal_year,
+                "Metric": adjustment["label"],
+                "Value": None,
+                "Grade": "Adjustment",
+                "Weight": None,
+                "Points": adjustment["points"],
+                "Weighted Points": adjustment["points"],
+                "Note": adjustment["note"],
             }
         )
     return rows
